@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package distkv.api;
+
+option java_multiple_files = true;
+option java_package = "com.distkv.proto";
+option java_outer_classname = "DistKvProto";
+
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (stream Entry);
+}
+
+service AdminService {
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc NodeJoin(NodeJoinRequest) returns (NodeJoinResponse);
+  rpc NodeLeave(NodeLeaveRequest) returns (NodeLeaveResponse);
+}
+
+service ReplicaService {
+  rpc Apply(ReplicaApplyRequest) returns (ReplicaApplyResponse);
+  rpc Read(ReplicaReadRequest) returns (ReplicaReadResponse);
+}
+
+enum ConsistencyLevel {
+  ONE = 0;
+  QUORUM = 1;
+  ALL = 2;
+}
+
+message GetRequest {
+  string key = 1;
+  ConsistencyLevel consistency = 2;
+}
+
+message GetResponse {
+  bool found = 1;
+  repeated ValueVersion versions = 2;
+  string message = 3;
+  int32 replicas_contacted = 4;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  ConsistencyLevel consistency = 3;
+}
+
+message PutResponse {
+  bool success = 1;
+  string message = 2;
+  int32 acks_required = 3;
+  int32 acks_received = 4;
+  ValueVersion version = 5;
+}
+
+message DeleteRequest {
+  string key = 1;
+  ConsistencyLevel consistency = 2;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string message = 2;
+  int32 acks_required = 3;
+  int32 acks_received = 4;
+}
+
+message ScanRequest {
+  string start_key = 1;
+  string end_key = 2;
+  ConsistencyLevel consistency = 3;
+}
+
+message Entry {
+  string key = 1;
+  ValueVersion version = 2;
+}
+
+message ValueVersion {
+  bytes value = 1;
+  int64 timestamp_epoch_ms = 2;
+  map<string, int64> vector_clock = 3;
+  bool tombstone = 4;
+}
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message NodeJoinRequest {
+  NodeInfo node = 1;
+}
+
+message NodeJoinResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message NodeLeaveRequest {
+  string node_id = 1;
+}
+
+message NodeLeaveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string host = 2;
+  int32 grpc_port = 3;
+  bool healthy = 4;
+  string status = 5;
+  int64 heartbeat = 6;
+  int64 last_seen_epoch_ms = 7;
+}
+
+message ReplicaApplyRequest {
+  string key = 1;
+  ValueVersion version = 2;
+}
+
+message ReplicaApplyResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReplicaReadRequest {
+  string key = 1;
+}
+
+message ReplicaReadResponse {
+  bool responded = 1;
+  bool found = 2;
+  ValueVersion version = 3;
+  string message = 4;
+}
