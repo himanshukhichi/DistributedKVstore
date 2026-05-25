@@ -55,6 +55,16 @@ class InMemoryKeyValueStoreTest {
     }
 
     @Test
+    void evictsLeastRecentlyUsedKeyWhenMaxMemoryBytesIsReached() {
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore(clock, null, -1, 160, null);
+        store.put("alpha", "one".getBytes(), "node-a", 1);
+        store.put("beta", "two".getBytes(), "node-a", 2);
+
+        assertFalse(store.get("alpha").isPresent());
+        assertTrue(store.get("beta").isPresent());
+    }
+
+    @Test
     void compactsWalToSnapshotAndRecoversFromSnapshot() throws IOException {
         WALManager walManager = new WALManager(tempDir.resolve("node-a.wal"), 2);
         InMemoryKeyValueStore store = new InMemoryKeyValueStore(clock, walManager);

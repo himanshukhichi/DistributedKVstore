@@ -1,10 +1,10 @@
 # DistKV - Distributed Key-Value Store
 
-DistKV is a Java 17, gRPC, Dynamo-style distributed key-value store built as a resume-grade systems project. It demonstrates consistent hashing, quorum replication, vector clocks, hinted handoff, anti-entropy repair, WAL durability, gossip membership, Prometheus metrics, Grafana dashboards, Docker Compose deployment, and chaos testing.
+DistKV is a Java 21, gRPC, Dynamo-style distributed key-value store built as a resume-grade systems project. It demonstrates consistent hashing, quorum replication, vector clocks, hinted handoff, anti-entropy repair, WAL durability, gossip membership, Prometheus metrics, Grafana dashboards, Docker Compose deployment, and chaos testing.
 
 ## Stack
 
-- Java 17
+- Java 21
 - gRPC + Protocol Buffers
 - Netty via `grpc-netty-shaded`
 - Maven
@@ -54,8 +54,8 @@ Request flow:
   - `Get(GetRequest)` with `ConsistencyLevel` (ONE/QUORUM/ALL)
   - `Put(PutRequest)` with `ConsistencyLevel`
   - `Delete(DeleteRequest)` with `ConsistencyLevel`
-  - `Scan(ScanRequest) returns (stream Entry)` - **local reads only** (range queries always read from contacted node)
-- `ConsistencyLevel` enum: `ONE`, `QUORUM`, `ALL` (applies to Get/Put/Delete; Scan always local).
+  - `Scan(ScanRequest) returns (stream Entry)` with `ConsistencyLevel` - **local reads only** (range queries stream from the contacted node)
+- `ConsistencyLevel` enum: `ONE`, `QUORUM`, `ALL` is carried by all KV requests. Get/Put/Delete use it for quorum math; Scan carries it for API symmetry while streaming a local range.
 - `AdminService`
   - `ClusterStatus`
   - `NodeJoin`
@@ -75,6 +75,7 @@ Request flow:
 - Random healthy-node selection for each request.
 - Retry with exponential backoff.
 - Cluster-status refresh when a node fails.
+- `scanStreaming(...)` exposes the server-side Scan stream as a Java `Iterator<Entry>`; `scan(...)` remains a list-collecting convenience method.
 
 ### Routing Layer
 
@@ -82,7 +83,7 @@ Request flow:
 - `TreeMap` ring traversal for `O(log n)` lookup.
 - Configurable virtual nodes per physical node, defaulting to 150.
 - Preference list lookup returns `N` distinct physical nodes clockwise around the ring.
-- Coordinator pattern: the contacted node fans out to replicas and waits for the required read/write acknowledgements.
+- Coordinator pattern: the first node in the preference list coordinates Get/Put/Delete. If a client contacts another healthy node, that node forwards the request to the preference-list coordinator.
 
 ### Replication Layer
 
@@ -97,11 +98,12 @@ Request flow:
 
 ### Storage Layer
 
-- Thread-safe in-memory store backed by `ConcurrentHashMap`.
+- Thread-safe in-memory store backed by `ConcurrentHashMap`; gRPC request handlers run on Java 21 virtual threads.
 - WAL durability: every put/delete is appended before memory is updated.
 - Restart recovery by replaying WAL records.
 - Snapshot compaction after a configurable number of writes to prevent unbounded WAL growth.
 - Configurable LRU eviction using access-order tracking.
+- LRU caps can be entry-based (`DISTKV_MAX_ENTRIES`) or approximate-memory-based (`DISTKV_MAX_MEMORY_BYTES`).
 - Bloom filter checked before reads; a definite negative avoids the store lookup.
 - Bloom filter math is documented below.
 
@@ -126,6 +128,7 @@ Request flow:
   - `distkv_wal_size_bytes{node_id}`.
   - `distkv_pending_hints{node_id}`.
 - Grafana dashboard JSON in `deploy/grafana-dashboard.json`.
+- Grafana provisioning in `deploy/grafana/provisioning` auto-loads the Prometheus datasource and DistKV dashboard in Docker Compose.
 - Five dashboard panels:
   - Cluster ops/sec
   - P99 latency
@@ -199,6 +202,7 @@ Useful environment variables:
 | `DISTKV_DATA_DIR` | `data/<nodeId>` | WAL and snapshot directory |
 | `DISTKV_PEERS` | empty | Comma-separated `nodeId:host:port` peers |
 | `DISTKV_MAX_ENTRIES` | `-1` | LRU cap; negative means unbounded |
+| `DISTKV_MAX_MEMORY_BYTES` | `-1` | Approximate LRU memory cap; negative means unbounded |
 | `DISTKV_BLOOM_EXPECTED_INSERTIONS` | `100000` | Bloom filter expected key count |
 | `DISTKV_BLOOM_FALSE_POSITIVE_RATE` | `0.01` | Bloom filter false-positive probability |
 | `DISTKV_WAL_COMPACTION_WRITES` | `10000` | Snapshot/compact interval |
@@ -227,7 +231,7 @@ Services:
 - Prometheus: `http://localhost:9090`
 - Grafana: `http://localhost:3000` with `admin` / `admin`
 
-The dashboard JSON is available at `deploy/grafana-dashboard.json` for import into Grafana.
+Grafana auto-provisions Prometheus and the DistKV dashboard. The dashboard JSON is also available at `deploy/grafana-dashboard.json` if you want to inspect or import it manually.
 
 Bring everything down:
 
@@ -258,7 +262,7 @@ Stream a range scan (always local read from contacted node):
 
 ```bash
 grpcurl -plaintext \
-  -d '{"startKey":"a","endKey":"z"}' \
+  -d '{"startKey":"a","endKey":"z","consistency":"ONE"}' \
   localhost:50051 distkv.api.KVService/Scan
 ```
 

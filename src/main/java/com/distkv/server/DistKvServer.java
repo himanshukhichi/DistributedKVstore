@@ -29,6 +29,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,7 @@ public final class DistKvServer {
         int metricsPort = Integer.parseInt(getenv("DISTKV_METRICS_PORT", "9100"));
         int replicationFactor = Integer.parseInt(getenv("DISTKV_REPLICATION_FACTOR", "3"));
         int maxEntries = Integer.parseInt(getenv("DISTKV_MAX_ENTRIES", "-1"));
+        long maxMemoryBytes = Long.parseLong(getenv("DISTKV_MAX_MEMORY_BYTES", "-1"));
         long bloomExpectedInsertions = Long.parseLong(getenv("DISTKV_BLOOM_EXPECTED_INSERTIONS", "100000"));
         double bloomFalsePositiveRate = Double.parseDouble(getenv("DISTKV_BLOOM_FALSE_POSITIVE_RATE", "0.01"));
         long walCompactionWrites = Long.parseLong(getenv("DISTKV_WAL_COMPACTION_WRITES", "10000"));
@@ -60,6 +62,7 @@ public final class DistKvServer {
                 clock,
                 walManager,
                 maxEntries,
+                maxMemoryBytes,
                 new com.distkv.storage.BloomFilter(bloomExpectedInsertions, bloomFalsePositiveRate));
         store.recoverFromWal();
         DistKvMetrics metrics = new DistKvMetrics();
@@ -105,8 +108,11 @@ public final class DistKvServer {
                 Duration.ofSeconds(Long.parseLong(getenv("DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS", "30"))));
         antiEntropyService.start();
 
+        ExecutorService grpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        KVServiceImpl kvService = new KVServiceImpl(coordinator, store, metrics);
         Server server = ServerBuilder.forPort(port)
-                .addService(new KVServiceImpl(coordinator, store, metrics))
+                .executor(grpcExecutor)
+                .addService(kvService)
                 .addService(new AdminServiceImpl(membershipList, ring))
                 .addService(new ReplicaServiceImpl(store))
                 .build()
@@ -137,7 +143,9 @@ public final class DistKvServer {
             hintedHandoffManager.close();
             metrics.close();
             replicaClient.close();
+            kvService.close();
             server.shutdown();
+            grpcExecutor.shutdownNow();
         }, "distkv-shutdown"));
 
         System.out.printf("DistKV node %s listening on %s:%d%n", nodeId, host, port);

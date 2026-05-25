@@ -104,6 +104,10 @@ public final class QuorumCoordinator {
         return replicasFor(key).stream().findFirst();
     }
 
+    public String coordinatorNodeId() {
+        return coordinatorNodeId;
+    }
+
     private WriteQuorumResult write(String key, VersionedValue version, ConsistencyLevel consistencyLevel) {
         List<NodeEndpoint> replicas = replicasFor(key);
         if (replicas.isEmpty()) {

@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: DistKV
+    orgId: 1
+    folder: DistKV
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

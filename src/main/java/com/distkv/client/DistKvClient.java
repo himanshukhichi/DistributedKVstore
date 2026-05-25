@@ -94,17 +94,19 @@ public final class DistKvClient implements AutoCloseable {
     }
 
     public List<Entry> scan(String startKeyInclusive, String endKeyExclusive) {
+        Iterator<Entry> iterator = scanStreaming(startKeyInclusive, endKeyExclusive);
+        List<Entry> entries = new ArrayList<>();
+        iterator.forEachRemaining(entries::add);
+        return entries;
+    }
+
+    public Iterator<Entry> scanStreaming(String startKeyInclusive, String endKeyExclusive) {
         ScanRequest request = ScanRequest.newBuilder()
                 .setStartKey(startKeyInclusive == null ? "" : startKeyInclusive)
                 .setEndKey(endKeyExclusive == null ? "" : endKeyExclusive)
                 .setConsistency(defaultConsistency)
                 .build();
-        return executeWithRetry(node -> {
-            Iterator<Entry> iterator = kvStub(node).scan(request);
-            List<Entry> entries = new ArrayList<>();
-            iterator.forEachRemaining(entries::add);
-            return entries;
-        });
+        return executeWithRetry(node -> kvStub(node).scan(request));
     }
 
     public void refreshClusterStatus() {

@@ -10,7 +10,7 @@
     <description>Distributed key-value store built with Java, gRPC, and quorum replication.</description>
 
     <properties>
-        <maven.compiler.release>17</maven.compiler.release>
+        <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <grpc.version>1.64.0</grpc.version>
         <protobuf.version>3.25.3</protobuf.version>

@@ -69,12 +69,15 @@ services:
   grafana:
     image: grafana/grafana:11.2.0
     container_name: distkv-grafana
+    depends_on:
+      - prometheus
     ports:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana-dashboard.json:/var/lib/grafana/dashboards/distkv.json:ro
 
 volumes:

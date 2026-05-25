@@ -4,6 +4,7 @@ import com.distkv.model.ClockRelation;
 import com.distkv.model.VersionedValue;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -16,29 +17,41 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class InMemoryKeyValueStore implements KeyValueStore {
     private static final int UNLIMITED_ENTRIES = -1;
+    private static final long UNLIMITED_MEMORY_BYTES = -1L;
 
     private final ConcurrentHashMap<String, List<VersionedValue>> values = new ConcurrentHashMap<>();
     private final LinkedHashMap<String, Boolean> accessOrder = new LinkedHashMap<>(16, 0.75f, true);
     private final Clock clock;
     private final WALManager walManager;
     private final int maxEntries;
+    private final long maxMemoryBytes;
     private final BloomFilter bloomFilter;
+    private long estimatedMemoryBytes;
 
     public InMemoryKeyValueStore(Clock clock) {
-        this(clock, null, UNLIMITED_ENTRIES, null);
+        this(clock, null, UNLIMITED_ENTRIES, UNLIMITED_MEMORY_BYTES, null);
     }
 
     public InMemoryKeyValueStore(Clock clock, WALManager walManager) {
-        this(clock, walManager, UNLIMITED_ENTRIES, null);
+        this(clock, walManager, UNLIMITED_ENTRIES, UNLIMITED_MEMORY_BYTES, null);
     }
 
     public InMemoryKeyValueStore(Clock clock, WALManager walManager, int maxEntries, BloomFilter bloomFilter) {
+        this(clock, walManager, maxEntries, UNLIMITED_MEMORY_BYTES, bloomFilter);
+    }
+
+    public InMemoryKeyValueStore(Clock clock, WALManager walManager, int maxEntries,
+                                 long maxMemoryBytes, BloomFilter bloomFilter) {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.walManager = walManager;
         if (maxEntries == 0 || maxEntries < UNLIMITED_ENTRIES) {
             throw new IllegalArgumentException("maxEntries must be positive or -1 for unlimited");
         }
+        if (maxMemoryBytes == 0 || maxMemoryBytes < UNLIMITED_MEMORY_BYTES) {
+            throw new IllegalArgumentException("maxMemoryBytes must be positive or -1 for unlimited");
+        }
         this.maxEntries = maxEntries;
+        this.maxMemoryBytes = maxMemoryBytes;
         this.bloomFilter = bloomFilter;
     }
 
@@ -48,11 +61,15 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
         }
         values.clear();
         accessOrder.clear();
+        estimatedMemoryBytes = 0;
         walManager.restore().forEach((key, versions) -> {
-            values.put(key, List.copyOf(versions));
+            List<VersionedValue> copy = List.copyOf(versions);
+            values.put(key, copy);
+            estimatedMemoryBytes += estimateEntryBytes(key, copy);
             touch(key);
             versions.stream().filter(value -> !value.tombstone()).findAny().ifPresent(ignored -> addToBloom(key));
         });
+        evictIfNeeded();
     }
 
     @Override
@@ -82,7 +99,12 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         appendToWal(key, value);
-        values.compute(key, (ignored, current) -> mergeVersions(current, value));
+        values.compute(key, (ignored, current) -> {
+            List<VersionedValue> merged = mergeVersions(current, value);
+            estimatedMemoryBytes -= estimateEntryBytes(key, current);
+            estimatedMemoryBytes += estimateEntryBytes(key, merged);
+            return merged;
+        });
         touch(key);
         addToBloom(key);
         evictIfNeeded();
@@ -235,20 +257,44 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
     }
 
     private void touch(String key) {
-        if (maxEntries == UNLIMITED_ENTRIES || key == null || key.isBlank()) {
+        if ((maxEntries == UNLIMITED_ENTRIES && maxMemoryBytes == UNLIMITED_MEMORY_BYTES)
+                || key == null
+                || key.isBlank()) {
             return;
         }
         accessOrder.put(key, Boolean.TRUE);
     }
 
     private void evictIfNeeded() {
-        if (maxEntries == UNLIMITED_ENTRIES) {
+        if (maxEntries == UNLIMITED_ENTRIES && maxMemoryBytes == UNLIMITED_MEMORY_BYTES) {
             return;
         }
-        while (values.size() > maxEntries && !accessOrder.isEmpty()) {
+        while (isOverCapacity() && !accessOrder.isEmpty()) {
             String eldestKey = accessOrder.keySet().iterator().next();
             accessOrder.remove(eldestKey);
-            values.remove(eldestKey);
+            List<VersionedValue> removed = values.remove(eldestKey);
+            estimatedMemoryBytes -= estimateEntryBytes(eldestKey, removed);
         }
+    }
+
+    private boolean isOverCapacity() {
+        boolean overEntryLimit = maxEntries != UNLIMITED_ENTRIES && values.size() > maxEntries;
+        boolean overMemoryLimit = maxMemoryBytes != UNLIMITED_MEMORY_BYTES
+                && estimatedMemoryBytes > maxMemoryBytes;
+        return overEntryLimit || overMemoryLimit;
+    }
+
+    private long estimateEntryBytes(String key, List<VersionedValue> versions) {
+        if (key == null || versions == null || versions.isEmpty()) {
+            return 0L;
+        }
+        long total = 64L + key.getBytes(StandardCharsets.UTF_8).length;
+        for (VersionedValue version : versions) {
+            total += Long.BYTES + 1L + version.value().length;
+            for (Map.Entry<String, Long> clockEntry : version.vectorClock().entrySet()) {
+                total += clockEntry.getKey().getBytes(StandardCharsets.UTF_8).length + Long.BYTES;
+            }
+        }
+        return total;
     }
 }

@@ -19,7 +19,7 @@ The DistributedKVstore project **implements all specified features correctly**. 
 - ✅ Production-grade deployment (Docker Compose)
 
 **Issues Found**: 1 (fixed)
-- ⚠️ Scan consistency parameter unused in proto → **FIXED**
+- ⚠️ `DistKvClient.scan()` expected `ScanRequest.consistency`, but the proto did not define it → **FIXED**
 
 ---
 
@@ -41,7 +41,7 @@ The DistributedKVstore project **implements all specified features correctly**. 
 - All RPC methods implemented with proper error handling
 - Metrics recording for all operations
 - Protobuf version 3.25.3, gRPC 1.64.0
-- **Fix Applied**: Removed unused `consistency` field from ScanRequest proto (scans are local-only)
+- **Fix Applied**: Added `consistency` to `ScanRequest`; scans still stream local ranges, but every KV request now carries the enum.
 
 ---
 
@@ -303,29 +303,28 @@ com.distkv/
 
 ## Issues Fixed
 
-### Issue 1: Scan Consistency Parameter Unused
+### Issue 1: Scan Consistency Parameter Missing
 **Severity**: Medium  
 **Status**: ✅ **FIXED**
 
 **Problem**:
-- Proto defined `ScanRequest.consistency: ConsistencyLevel`
-- Implementation ignored it in `KVServiceImpl.scan()`
-- Creates confusion about scan semantics
+- `DistKvClient.scan()` set `ScanRequest.consistency`
+- `kv.proto` did not define that field
+- Fresh protobuf generation caused compilation to fail
 
 **Root Cause**:
-Scans are intentionally local-only reads (no quorum):
-- Range queries on multiple replicas would be expensive
-- Coordinator doesn't implement distributed scans
-- Local scans simplify client logic
+The code and API contract drifted:
+- The feature list requires each KV request to carry `ConsistencyLevel`
+- Scan is intentionally local streaming rather than distributed quorum scan
+- The client already followed the feature list, while the proto did not
 
 **Fix Applied**:
-1. Removed `consistency` field from `ScanRequest` proto (kv.proto:74-78)
-2. Added clarifying comment in `KVServiceImpl.scan()` explaining scans are local-only
-3. Updated documentation: "For distributed range queries, clients can scan any node and merge/filter results"
+1. Added `consistency` field to `ScanRequest` proto
+2. Kept `KVServiceImpl.scan()` as a local server-side streaming range scan
+3. Updated documentation to explain that Scan carries consistency for API symmetry but does not perform distributed quorum range reads
 
 **Verification**:
-- Proto recompilation successful
-- No breaking changes (field was unused)
+- `mvn test` passes
 - grpcurl examples updated in README
 
 ---
@@ -376,9 +375,10 @@ Scans are intentionally local-only reads (no quorum):
 - ✅ 3-node cluster pre-configured
 - ✅ Prometheus scraping configured (5s interval)
 - ✅ Grafana dashboard JSON (`deploy/grafana-dashboard.json`)
+- ✅ Grafana datasource/dashboard provisioning (`deploy/grafana/provisioning`)
 - ✅ Persistent volumes for each node
 - ✅ Environment variable overrides supported
-- ✅ Health check endpoints exposed (port 9100-9102)
+- ✅ Metrics endpoints exposed (`localhost:9101`-`9103` mapped to container port `9100`)
 
 **Quick Start**:
 ```bash

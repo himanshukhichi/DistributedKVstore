@@ -335,7 +335,7 @@ Every second (default):
 KVService.Get(GetRequest) → GetResponse
 KVService.Put(PutRequest) → PutResponse
 KVService.Delete(DeleteRequest) → DeleteResponse
-KVService.Scan(ScanRequest) → stream Entry
+KVService.Scan(ScanRequest with ConsistencyLevel) → stream Entry
 
 AdminService.ClusterStatus() → ClusterStatusResponse
 AdminService.NodeJoin(node) → NodeJoinResponse
@@ -347,15 +347,18 @@ ReplicaService.Read(key) → versions
 ReplicaService.Merkle(startKey, endKey) → root_hash + leaf_hashes
 ```
 
-**Key point**: The gRPC layer **translates** between Protocol Buffers (wire format) and Java objects (`VersionedValue`, `NodeEndpoint`, etc.).
+**Key point**: The gRPC layer **translates** between Protocol Buffers (wire format) and Java objects (`VersionedValue`, `NodeEndpoint`, etc.). All KV requests carry `ConsistencyLevel`; Scan keeps the field for API symmetry but streams a local range from the contacted node.
+
+The Java client exposes both `scanStreaming(...)`, which returns an `Iterator<Entry>` over the server stream, and `scan(...)`, which collects that stream into a list for simple demos.
 
 **Example flow** (`KVServiceImpl.put()`):
 ```
 1. Receive PutRequest(key, value, consistency)
-2. Call coordinator.put(key, value, consistency)
-3. Get WriteQuorumResult
-4. Convert to PutResponse
-5. Return to client
+2. If this node is not first in the key's preference list, forward to that coordinator
+3. Call coordinator.put(key, value, consistency)
+4. Get WriteQuorumResult
+5. Convert to PutResponse
+6. Return to client
 ```
 
 **Data model** (in `.proto`):
@@ -388,6 +391,8 @@ ring.removeNode(nodeId)              // Remove when node dies
 ring.getPreferenceList(key, 3)       // [N1, N2, N3] in ring order
 ring.getCoordinator(key)             // N1 (first replica)
 ```
+
+The first node in the preference list is the coordinator for Get/Put/Delete. The Java client still picks a random healthy node, so a non-coordinator node forwards the request to the correct coordinator before the quorum fan-out.
 
 **Ring structure**:
 ```
@@ -514,6 +519,8 @@ ALL + ALL = 6 > 3      → Always overlap ✓
 
 **What it does**: Persist and retrieve key-value pairs durably.
 
+The in-memory store is synchronized around mutations and backed by a `ConcurrentHashMap`; the gRPC server uses Java 21 virtual threads for request handlers, so blocking quorum fan-out and WAL work do not consume a fixed platform-thread pool.
+
 **Key methods**:
 
 ```java
@@ -561,6 +568,10 @@ public Stream<Entry> scan(String startKey, String endKey) {
     .sorted();
 }
 ```
+
+**LRU capacity controls**:
+- `DISTKV_MAX_ENTRIES` caps the number of keys.
+- `DISTKV_MAX_MEMORY_BYTES` caps approximate in-memory bytes and evicts least-recently-used keys when the estimate is exceeded.
 
 **Restart recovery**:
 
@@ -915,7 +926,7 @@ docker compose up --build -d
 mvn -DskipTests package
 
 # Run demo with load
-java -cp target/distkv.jar \
+java -cp target/distkv-0.1.0-SNAPSHOT.jar \
   com.distkv.client.DistKvDemoClient cluster
 
 # Monitor with Prometheus/Grafana
@@ -931,7 +942,7 @@ java -cp target/distkv.jar \
 **Quick start**:
 ```bash
 # Terminal 1: Start one node
-java -jar target/distkv.jar
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
 # Listens on localhost:50051
 
 # Terminal 2: Use grpcurl
@@ -944,7 +955,7 @@ grpcurl -plaintext \
   localhost:50051 distkv.api.KVService/Get
 
 # Or use Java client
-java -cp target/distkv.jar \
+java -cp target/distkv-0.1.0-SNAPSHOT.jar \
   com.distkv.client.DistKvDemoClient smoke
 ```
 
@@ -959,27 +970,27 @@ java -cp target/distkv.jar \
 # Terminal 1: Node 1
 DISTKV_NODE_ID=node-1 \
 DISTKV_PORT=50051 \
-java -jar target/distkv.jar
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
 
 # Terminal 2: Node 2
 DISTKV_NODE_ID=node-2 \
 DISTKV_HOST=localhost \
 DISTKV_PORT=50052 \
 DISTKV_PEERS=node-1:localhost:50051 \
-java -jar target/distkv.jar
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
 
 # Terminal 3: Node 3
 DISTKV_NODE_ID=node-3 \
 DISTKV_HOST=localhost \
 DISTKV_PORT=50053 \
 DISTKV_PEERS=node-1:localhost:50051,node-2:localhost:50052 \
-java -jar target/distkv.jar
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
 ```
 
 **Test quorum**:
 ```bash
 # All 3 nodes are alive, write reaches all 3
-java -cp target/distkv.jar com.distkv.client.DistKvDemoClient cluster
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient cluster
 
 # Check cluster status (before/after removing a node)
 grpcurl -plaintext -d '{}' localhost:50051 distkv.api.AdminService/ClusterStatus
@@ -1010,7 +1021,7 @@ docker compose up --build -d
 **Grafana dashboard**:
 1. Go to http://localhost:3000
 2. Login with admin/admin
-3. Import dashboard from `deploy/grafana-dashboard.json`
+3. Open the auto-provisioned DistKV dashboard
 4. Watch metrics in real-time as you write/read
 
 **Panels**:
@@ -1019,6 +1030,8 @@ docker compose up --build -d
 - **Node health**: Heatmap showing which nodes are alive
 - **Quorum failures**: Failed writes (should be 0 with healthy nodes)
 - **WAL size**: Disk space per node
+
+The dashboard JSON lives at `deploy/grafana-dashboard.json`; provisioning files under `deploy/grafana/provisioning` wire Grafana to Prometheus automatically.
 
 **Cleanup**:
 ```bash
@@ -1077,7 +1090,7 @@ cd ..
 
 ```bash
 # Run this test
-java -cp target/distkv.jar com.distkv.storage.BloomFilterTest
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.storage.BloomFilterTest
 
 # Expected output:
 # Bloom filter false positive rate: ~1.0%

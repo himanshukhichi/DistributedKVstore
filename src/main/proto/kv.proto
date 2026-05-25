@@ -74,6 +74,7 @@ message DeleteResponse {
 message ScanRequest {
   string start_key = 1;
   string end_key = 2;
+  ConsistencyLevel consistency = 3;
 }
 
 message Entry {
