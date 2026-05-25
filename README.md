@@ -233,6 +233,14 @@ Services:
 
 Grafana auto-provisions Prometheus and the DistKV dashboard. The dashboard JSON is also available at `deploy/grafana-dashboard.json` if you want to inspect or import it manually.
 
+After startup, Prometheus should show all three DistKV scrape targets as healthy:
+
+![Prometheus targets showing all three DistKV nodes up](docs/images/prometheus-targets.jpg)
+
+The Grafana dashboard should show cluster operations, latency, node health, quorum failures, and WAL size:
+
+![Grafana DistKV cluster dashboard with operational metrics](docs/images/grafana-dashboard.jpg)
+
 Bring everything down:
 
 ```bash
