@@ -1,6 +1,6 @@
 # DistKV - Distributed Key-Value Store
 
-DistKV is a Java 21, gRPC, Dynamo-style distributed key-value store built as a resume-grade systems project. It demonstrates consistent hashing, quorum replication, vector clocks, hinted handoff, anti-entropy repair, WAL durability, gossip membership, Prometheus metrics, Grafana dashboards, Docker Compose deployment, and chaos testing.
+DistKV is a Java 21, gRPC, Dynamo-style distributed key-value store. It demonstrates consistent hashing, quorum replication, vector clocks, hinted handoff, anti-entropy repair, WAL durability, gossip membership, Prometheus metrics, Grafana dashboards, Docker Compose deployment, and chaos testing.
 
 ## Stack
 
