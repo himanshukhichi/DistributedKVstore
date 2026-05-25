@@ -13,26 +13,39 @@ import java.util.concurrent.TimeUnit;
 public final class GossipService implements AutoCloseable {
     public static final int DEFAULT_FANOUT = 2;
     public static final int DEFAULT_SUSPECT_AFTER_CYCLES = 3;
+    public static final int DEFAULT_DEAD_AFTER_CYCLES = 6;
 
     private final MembershipList membershipList;
     private final GossipPeerClient peerClient;
+    private final MembershipChangeListener changeListener;
     private final Duration interval;
     private final int fanout;
     private final int suspectAfterCycles;
+    private final int deadAfterCycles;
     private final ScheduledExecutorService executor;
     private ScheduledFuture<?> scheduledTask;
 
     public GossipService(MembershipList membershipList, GossipPeerClient peerClient) {
-        this(membershipList, peerClient, Duration.ofSeconds(1), DEFAULT_FANOUT, DEFAULT_SUSPECT_AFTER_CYCLES);
+        this(membershipList, peerClient, member -> {
+        }, Duration.ofSeconds(1), DEFAULT_FANOUT, DEFAULT_SUSPECT_AFTER_CYCLES, DEFAULT_DEAD_AFTER_CYCLES);
     }
 
     public GossipService(MembershipList membershipList, GossipPeerClient peerClient, Duration interval,
                          int fanout, int suspectAfterCycles) {
+        this(membershipList, peerClient, member -> {
+        }, interval, fanout, suspectAfterCycles, DEFAULT_DEAD_AFTER_CYCLES);
+    }
+
+    public GossipService(MembershipList membershipList, GossipPeerClient peerClient,
+                         MembershipChangeListener changeListener, Duration interval,
+                         int fanout, int suspectAfterCycles, int deadAfterCycles) {
         this.membershipList = Objects.requireNonNull(membershipList, "membershipList");
         this.peerClient = Objects.requireNonNull(peerClient, "peerClient");
+        this.changeListener = Objects.requireNonNull(changeListener, "changeListener");
         this.interval = Objects.requireNonNull(interval, "interval");
         this.fanout = fanout;
         this.suspectAfterCycles = suspectAfterCycles;
+        this.deadAfterCycles = deadAfterCycles;
         this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "distkv-gossip");
             thread.setDaemon(true);
@@ -54,12 +67,14 @@ public final class GossipService implements AutoCloseable {
         peers.stream().limit(fanout).forEach(peer -> {
             try {
                 List<MemberInfo> remoteMembership = peerClient.exchange(peer.endpoint(), membershipList.snapshot());
+                membershipList.addOrMarkAlive(peer.endpoint());
                 membershipList.merge(remoteMembership);
             } catch (Exception ignored) {
                 // Missed gossip rounds are converted to SUSPECT by markSuspects.
             }
         });
-        membershipList.markSuspects(interval.toMillis(), suspectAfterCycles);
+        membershipList.markFailures(interval.toMillis(), suspectAfterCycles, deadAfterCycles)
+                .forEach(changeListener::onMemberDead);
     }
 
     @Override

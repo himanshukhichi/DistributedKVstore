@@ -80,7 +80,8 @@ public final class MembershipList {
                 if (current == null) {
                     return new MutableMember(remote.endpoint(), new AtomicLong(remote.heartbeat()), now, remote.status());
                 }
-                if (remote.status() == MemberStatus.DEAD) {
+                if (remote.status() == MemberStatus.DEAD
+                        && remote.lastSeenEpochMs() >= current.lastSeenEpochMs) {
                     current.status = MemberStatus.DEAD;
                     current.lastSeenEpochMs = now;
                     return current;
@@ -106,6 +107,26 @@ public final class MembershipList {
                 member.status = MemberStatus.SUSPECT;
             }
         });
+    }
+
+    public List<MemberInfo> markFailures(long gossipIntervalMillis, int suspectAfterCycles, int deadAfterCycles) {
+        long now = clock.millis();
+        long suspectAfterMillis = gossipIntervalMillis * suspectAfterCycles;
+        long deadAfterMillis = gossipIntervalMillis * deadAfterCycles;
+        List<MemberInfo> newlyDead = new java.util.ArrayList<>();
+        members.forEach((nodeId, member) -> {
+            if (nodeId.equals(localNodeId) || member.status == MemberStatus.DEAD) {
+                return;
+            }
+            long staleForMillis = now - member.lastSeenEpochMs;
+            if (staleForMillis >= deadAfterMillis) {
+                member.status = MemberStatus.DEAD;
+                newlyDead.add(member.snapshot());
+            } else if (staleForMillis >= suspectAfterMillis) {
+                member.status = MemberStatus.SUSPECT;
+            }
+        });
+        return List.copyOf(newlyDead);
     }
 
     private static final class MutableMember {

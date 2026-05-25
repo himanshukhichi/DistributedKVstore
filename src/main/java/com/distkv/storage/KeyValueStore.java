@@ -17,7 +17,13 @@ public interface KeyValueStore {
 
     Optional<VersionedValue> getIncludingTombstone(String key);
 
+    List<VersionedValue> getVersions(String key);
+
+    List<VersionedValue> getVersionsIncludingTombstone(String key);
+
     List<StoredEntry> scan(String startKeyInclusive, String endKeyExclusive);
 
     Map<String, VersionedValue> snapshot();
+
+    Map<String, List<VersionedValue>> snapshotVersions();
 }

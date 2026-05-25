@@ -1,0 +1,70 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        { "expr": "sum by (op) (rate(distkv_ops_total[1m]))", "legendFormat": "{{op}}" }
+      ],
+      "title": "Cluster Ops/Sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le, op) (rate(distkv_latency_seconds_bucket[5m])))", "legendFormat": "p99 {{op}}" }
+      ],
+      "title": "P99 Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "max": 1, "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [
+        { "expr": "distkv_node_health", "legendFormat": "{{node_id}}" }
+      ],
+      "title": "Node Health Heatmap",
+      "type": "heatmap"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "id": 4,
+      "targets": [
+        { "expr": "rate(distkv_quorum_failures_total[1m])", "legendFormat": "failures/sec" }
+      ],
+      "title": "Quorum Failure Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "id": 5,
+      "targets": [
+        { "expr": "distkv_wal_size_bytes", "legendFormat": "{{node_id}}" }
+      ],
+      "title": "WAL Size Per Node",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["distkv"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "title": "DistKV Cluster",
+  "uid": "distkv-cluster",
+  "version": 1
+}

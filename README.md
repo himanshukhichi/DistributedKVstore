@@ -1,6 +1,6 @@
-# Distributed KV store
+# DistKV - Distributed Key-Value Store
 
-DistKV is a Java 17 distributed key-value store project built for demonstrating the internals behind Dynamo-style storage systems: gRPC APIs, consistent hashing, quorum replication, WAL-backed storage, and gossip membership.
+DistKV is a Java 17, gRPC, Dynamo-style distributed key-value store built as a resume-grade systems project. It demonstrates consistent hashing, quorum replication, vector clocks, hinted handoff, anti-entropy repair, WAL durability, gossip membership, Prometheus metrics, Grafana dashboards, Docker Compose deployment, and chaos testing.
 
 ## Stack
 
@@ -8,35 +8,144 @@ DistKV is a Java 17 distributed key-value store project built for demonstrating 
 - gRPC + Protocol Buffers
 - Netty via `grpc-netty-shaded`
 - Maven
+- Docker Compose
+- Prometheus
+- Grafana
 - JUnit 5
 - Mockito
 
-## Core Features Implemented
+## Architecture
 
-- `KVService` protobuf API: `Get`, `Put`, `Delete`, and server-streaming `Scan`.
-- Per-request `ConsistencyLevel`: `ONE`, `QUORUM`, `ALL`.
-- `AdminService` protobuf API: `ClusterStatus`, `NodeJoin`, `NodeLeave`.
-- MD5-based consistent hash ring with configurable virtual nodes, defaulting to 150.
-- Preference list lookup returning distinct physical replicas in clockwise ring order.
-- Quorum coordinator for parallel replica writes and reads.
-- Internal gRPC replica service/client for node-to-node read/write fanout.
-- In-memory thread-safe storage using `ConcurrentHashMap`.
-- Write-ahead log that appends every write/delete before memory is updated and replays on restart.
-- Gossip membership model with heartbeat counters, fanout of 2 peers per cycle, and suspect marking after 3 missed cycles.
-- Bloom filter implementation with configurable false-positive rate.
-- Unit tests for hash-ring distribution, WAL replay, Bloom filter false-positive rate, and quorum combinations.
-
-## Project Layout
-
-```text
-src/main/proto/kv.proto          gRPC service and message definitions
-src/main/java/com/distkv/routing Consistent hash ring
-src/main/java/com/distkv/storage Per-node storage, WAL, Bloom filter
-src/main/java/com/distkv/replication Quorum coordinator and replica clients
-src/main/java/com/distkv/membership Gossip membership types
-src/main/java/com/distkv/grpc     gRPC service implementations
-src/test/java/com/distkv          Core unit tests
+```mermaid
+flowchart LR
+    Client["Java client / grpcurl"] --> KV["KVService gRPC API"]
+    KV --> Coordinator["QuorumCoordinator"]
+    Coordinator --> Ring["Consistent hash ring"]
+    Ring --> Pref["Preference list"]
+    Coordinator --> R1["Replica node 1"]
+    Coordinator --> R2["Replica node 2"]
+    Coordinator --> R3["Replica node 3"]
+    R1 --> Store1["WAL + in-memory store"]
+    R2 --> Store2["WAL + in-memory store"]
+    R3 --> Store3["WAL + in-memory store"]
+    Gossip["Gossip membership"] --> Ring
+    Repair["Anti-entropy repair"] --> R1
+    Repair --> R2
+    Repair --> R3
+    Metrics["Prometheus metrics"] --> Grafana["Grafana dashboard"]
 ```
+
+Request flow:
+
+1. A client calls `Put`, `Get`, `Delete`, or streaming `Scan`.
+2. The coordinator hashes the key through the consistent hash ring.
+3. The ring returns a preference list of replica nodes.
+4. The coordinator sends replica RPCs in parallel.
+5. The request succeeds when the configured consistency level has enough acknowledgements.
+6. Storage appends to the WAL before mutating memory.
+7. Gossip updates membership and removes dead nodes from the ring.
+8. Hinted handoff and anti-entropy repair heal temporary replica failures and stale data.
+
+## Implemented Features
+
+### gRPC API Layer
+
+- `KVService`
+  - `Get(GetRequest)` with `ConsistencyLevel` (ONE/QUORUM/ALL)
+  - `Put(PutRequest)` with `ConsistencyLevel`
+  - `Delete(DeleteRequest)` with `ConsistencyLevel`
+  - `Scan(ScanRequest) returns (stream Entry)` - **local reads only** (range queries always read from contacted node)
+- `ConsistencyLevel` enum: `ONE`, `QUORUM`, `ALL` (applies to Get/Put/Delete; Scan always local).
+- `AdminService`
+  - `ClusterStatus`
+  - `NodeJoin`
+  - `NodeLeave`
+- Internal `ReplicaService` for node-to-node replication, replica reads, version repair, Merkle comparison, and version fetches.
+- Server-side streaming range scan so clients receive entries one at a time.
+
+### Client Library
+
+- `DistKvClient` wraps generated gRPC stubs behind a simple Java API.
+- Builder API:
+  - `addNode(...)`
+  - `defaultConsistency(...)`
+  - `maxRetries(...)`
+  - `initialBackoff(...)`
+  - `rpcTimeout(...)`
+- Random healthy-node selection for each request.
+- Retry with exponential backoff.
+- Cluster-status refresh when a node fails.
+
+### Routing Layer
+
+- MD5-based consistent hash ring.
+- `TreeMap` ring traversal for `O(log n)` lookup.
+- Configurable virtual nodes per physical node, defaulting to 150.
+- Preference list lookup returns `N` distinct physical nodes clockwise around the ring.
+- Coordinator pattern: the contacted node fans out to replicas and waits for the required read/write acknowledgements.
+
+### Replication Layer
+
+- Quorum writes: send to all `N` replicas in parallel and wait for `W` acknowledgements.
+- Quorum reads: read from `R` replicas and return the newest visible value.
+- `ONE`, `QUORUM`, and `ALL` map to different acknowledgement requirements.
+- Vector clocks on every value: `{nodeId -> counter}`.
+- Concurrent writes are retained as sibling versions instead of overwriting each other.
+- Default read behavior returns latest visible value, while gRPC responses can include multiple versions for conflict visibility.
+- Hinted handoff stores a missed replica write locally and retries delivery when that replica is reachable again.
+- Anti-entropy repair periodically compares Merkle leaf hashes and syncs diverged keys between replicas.
+
+### Storage Layer
+
+- Thread-safe in-memory store backed by `ConcurrentHashMap`.
+- WAL durability: every put/delete is appended before memory is updated.
+- Restart recovery by replaying WAL records.
+- Snapshot compaction after a configurable number of writes to prevent unbounded WAL growth.
+- Configurable LRU eviction using access-order tracking.
+- Bloom filter checked before reads; a definite negative avoids the store lookup.
+- Bloom filter math is documented below.
+
+### Membership And Failure Detection
+
+- Gossip-style membership model with heartbeat counters.
+- Every cycle pings a small random fanout of peers.
+- A node becomes `SUSPECT` after missed heartbeat cycles.
+- A node becomes `DEAD` after sustained suspicion.
+- Dead nodes are removed from the consistent hash ring, so new operations skip them.
+- Admin API exposes cluster health for demos before and after killing a node.
+
+### Observability
+
+- Prometheus endpoint per node.
+- Metrics include:
+  - `distkv_ops_total{op}` for get/put/delete/scan counters; dashboard renders ops/sec with `rate(...)`.
+  - `distkv_latency_seconds{op}` histogram for latency and P99 queries.
+  - `distkv_quorum_failures_total`.
+  - `distkv_replication_lag_ms{node_id}`.
+  - `distkv_node_health{node_id}` gauge.
+  - `distkv_wal_size_bytes{node_id}`.
+  - `distkv_pending_hints{node_id}`.
+- Grafana dashboard JSON in `deploy/grafana-dashboard.json`.
+- Five dashboard panels:
+  - Cluster ops/sec
+  - P99 latency
+  - Node health heatmap
+  - Quorum failure rate
+  - WAL size per node
+
+### Testing And Chaos
+
+- Unit tests cover:
+  - Consistent hash ring distribution.
+  - WAL replay correctness.
+  - Bloom filter false-positive rate.
+  - Quorum `R + W > N` combinations.
+  - Vector-clock conflict siblings.
+  - LRU eviction.
+  - WAL snapshot compaction and recovery.
+  - Hinted handoff delivery.
+  - Merkle divergence detection.
+- Chaos demo in `test/chaos` kills a node during a write burst and verifies quorum behavior with two of three replicas alive.
 
 ## Build And Test
 
@@ -44,22 +153,140 @@ src/test/java/com/distkv          Core unit tests
 mvn test
 ```
 
-Run a single local node:
+Build the runnable shaded jar:
+
+```bash
+mvn -DskipTests package
+```
+
+Run one local node:
+
+```bash
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
+```
+
+Or run through Maven:
 
 ```bash
 mvn exec:java
 ```
 
-Useful environment variables:
+Run the built-in Java demo client against three local nodes:
 
 ```bash
-DISTKV_NODE_ID=node-1
-DISTKV_HOST=localhost
-DISTKV_PORT=50051
-DISTKV_REPLICATION_FACTOR=3
-DISTKV_DATA_DIR=data/node-1
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient smoke
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient cluster
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient get chaos-after-25
+```
+
+The demo client also has a local replica check for repair demos:
+
+```bash
+java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient replica-read localhost 50053 chaos-after-25
+```
+
+## Local Configuration
+
+Useful environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DISTKV_NODE_ID` | `node-1` | Logical node id |
+| `DISTKV_HOST` | `localhost` | Host advertised to other nodes |
+| `DISTKV_PORT` | `50051` | gRPC API port |
+| `DISTKV_METRICS_PORT` | `9100` | Prometheus scrape port |
+| `DISTKV_REPLICATION_FACTOR` | `3` | Number of replicas per key |
+| `DISTKV_DATA_DIR` | `data/<nodeId>` | WAL and snapshot directory |
+| `DISTKV_PEERS` | empty | Comma-separated `nodeId:host:port` peers |
+| `DISTKV_MAX_ENTRIES` | `-1` | LRU cap; negative means unbounded |
+| `DISTKV_BLOOM_EXPECTED_INSERTIONS` | `100000` | Bloom filter expected key count |
+| `DISTKV_BLOOM_FALSE_POSITIVE_RATE` | `0.01` | Bloom filter false-positive probability |
+| `DISTKV_WAL_COMPACTION_WRITES` | `10000` | Snapshot/compact interval |
+| `DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS` | `30` | Replica repair interval |
+
+Example three-node local peer value:
+
+```bash
 DISTKV_PEERS=node-2:localhost:50052,node-3:localhost:50053
 ```
+
+## Docker Compose Demo
+
+Start a three-node cluster plus Prometheus and Grafana:
+
+```bash
+cd deploy
+docker compose up --build -d
+```
+
+Services:
+
+- Node 1 gRPC: `localhost:50051`, metrics: `localhost:9101`
+- Node 2 gRPC: `localhost:50052`, metrics: `localhost:9102`
+- Node 3 gRPC: `localhost:50053`, metrics: `localhost:9103`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000` with `admin` / `admin`
+
+The dashboard JSON is available at `deploy/grafana-dashboard.json` for import into Grafana.
+
+Bring everything down:
+
+```bash
+cd deploy
+docker compose down -v
+```
+
+## grpcurl Examples
+
+Put a value. The `value` field is bytes, so JSON uses base64:
+
+```bash
+grpcurl -plaintext \
+  -d '{"key":"hello","value":"d29ybGQ=","consistency":"QUORUM"}' \
+  localhost:50051 distkv.api.KVService/Put
+```
+
+Read it back:
+
+```bash
+grpcurl -plaintext \
+  -d '{"key":"hello","consistency":"QUORUM"}' \
+  localhost:50051 distkv.api.KVService/Get
+```
+
+Stream a range scan (always local read from contacted node):
+
+```bash
+grpcurl -plaintext \
+  -d '{"startKey":"a","endKey":"z"}' \
+  localhost:50051 distkv.api.KVService/Scan
+```
+
+Show cluster status:
+
+```bash
+grpcurl -plaintext \
+  -d '{}' \
+  localhost:50051 distkv.api.AdminService/ClusterStatus
+```
+
+## Chaos Test
+
+Prerequisites:
+
+- Docker and Docker Compose
+- `grpcurl` is optional. If it is not installed locally, the script uses the `fullstorydev/grpcurl` Docker image on the Compose network.
+
+Run:
+
+```bash
+cd deploy
+docker compose up --build -d
+cd ..
+./test/chaos/chaos-quorum.sh
+```
+
+The script writes through node 1, stops node 3 mid-burst, continues writing with `QUORUM`, and reads a key back while only two of three nodes are alive.
 
 ## Bloom Filter Math
 
@@ -70,6 +297,20 @@ m = ceil(-(n * ln(p)) / (ln(2)^2))
 k = round((m / n) * ln(2))
 ```
 
-With `n = 1000` and `p = 0.01`, DistKV uses `m = 9586` bits and `k = 7` hash functions.
+Where:
 
-## Notes
+- `m` is the number of bits.
+- `k` is the number of hash functions.
+- `p` defaults to `0.01`.
+
+For `n = 100000` and `p = 0.01`, the filter uses about `958506` bits and `7` hash functions.
+
+## Interview Talking Points
+
+- DistKV uses consistent hashing so adding/removing nodes only remaps part of the keyspace.
+- Quorum consistency works because `R + W > N` guarantees read/write overlap.
+- Vector clocks detect concurrent writes that cannot be safely ordered by timestamp alone.
+- WAL guarantees durability by recording mutations before applying them to memory.
+- Hinted handoff handles short outages; anti-entropy handles longer divergence.
+- Gossip avoids a single centralized membership service.
+- Prometheus and Grafana make the system observable under load and during failures.

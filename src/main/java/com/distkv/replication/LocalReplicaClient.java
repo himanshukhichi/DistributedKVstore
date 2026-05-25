@@ -5,8 +5,8 @@ import com.distkv.model.VersionedValue;
 import com.distkv.storage.KeyValueStore;
 
 import java.util.Map;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -36,8 +36,8 @@ public final class LocalReplicaClient implements ReplicaClient {
             if (store == null) {
                 return ReplicaReadResult.failed("node " + node.nodeId() + " is not reachable");
             }
-            Optional<VersionedValue> value = store.getIncludingTombstone(key);
-            return value.map(ReplicaReadResult::found).orElseGet(ReplicaReadResult::notFound);
+            List<VersionedValue> values = store.getVersionsIncludingTombstone(key);
+            return values.isEmpty() ? ReplicaReadResult.notFound() : ReplicaReadResult.found(values);
         });
     }
 }

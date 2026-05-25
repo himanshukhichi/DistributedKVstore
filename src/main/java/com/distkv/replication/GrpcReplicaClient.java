@@ -16,7 +16,6 @@ import io.grpc.StatusRuntimeException;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -60,8 +59,8 @@ public final class GrpcReplicaClient implements ReplicaClient, AutoCloseable {
     public CompletableFuture<ReplicaReadResult> read(NodeEndpoint node, String key) {
         if (node.nodeId().equals(localEndpoint.nodeId())) {
             return CompletableFuture.supplyAsync(() -> {
-                Optional<VersionedValue> value = localStore.getIncludingTombstone(key);
-                return value.map(ReplicaReadResult::found).orElseGet(ReplicaReadResult::notFound);
+                java.util.List<VersionedValue> values = localStore.getVersionsIncludingTombstone(key);
+                return values.isEmpty() ? ReplicaReadResult.notFound() : ReplicaReadResult.found(values);
             });
         }
         return CompletableFuture.supplyAsync(() -> {
@@ -73,7 +72,9 @@ public final class GrpcReplicaClient implements ReplicaClient, AutoCloseable {
                     return ReplicaReadResult.failed(response.getMessage());
                 }
                 return response.getFound()
-                        ? ReplicaReadResult.found(ProtoMappers.fromProto(response.getVersion()))
+                        ? ReplicaReadResult.found(response.getVersionsList().stream()
+                                .map(ProtoMappers::fromProto)
+                                .toList())
                         : ReplicaReadResult.notFound();
             } catch (StatusRuntimeException exception) {
                 return ReplicaReadResult.failed(exception.getStatus().toString());

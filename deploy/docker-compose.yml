@@ -1,0 +1,83 @@
+services:
+  distkv-node-1:
+    build:
+      context: ..
+    container_name: distkv-node-1
+    environment:
+      DISTKV_NODE_ID: node-1
+      DISTKV_HOST: distkv-node-1
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-1
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-2:distkv-node-2:50051,node-3:distkv-node-3:50051
+      DISTKV_WAL_COMPACTION_WRITES: 1000
+    ports:
+      - "50051:50051"
+      - "9101:9100"
+    volumes:
+      - distkv-node-1:/data
+
+  distkv-node-2:
+    build:
+      context: ..
+    container_name: distkv-node-2
+    environment:
+      DISTKV_NODE_ID: node-2
+      DISTKV_HOST: distkv-node-2
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-2
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:distkv-node-1:50051,node-3:distkv-node-3:50051
+      DISTKV_WAL_COMPACTION_WRITES: 1000
+    ports:
+      - "50052:50051"
+      - "9102:9100"
+    volumes:
+      - distkv-node-2:/data
+
+  distkv-node-3:
+    build:
+      context: ..
+    container_name: distkv-node-3
+    environment:
+      DISTKV_NODE_ID: node-3
+      DISTKV_HOST: distkv-node-3
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-3
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:distkv-node-1:50051,node-2:distkv-node-2:50051
+      DISTKV_WAL_COMPACTION_WRITES: 1000
+    ports:
+      - "50053:50051"
+      - "9103:9100"
+    volumes:
+      - distkv-node-3:/data
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: distkv-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: distkv-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/distkv.json:ro
+
+volumes:
+  distkv-node-1:
+  distkv-node-2:
+  distkv-node-3:

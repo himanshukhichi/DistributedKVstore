@@ -21,7 +21,10 @@ service AdminService {
 
 service ReplicaService {
   rpc Apply(ReplicaApplyRequest) returns (ReplicaApplyResponse);
+  rpc ApplyVersions(ReplicaApplyVersionsRequest) returns (ReplicaApplyResponse);
   rpc Read(ReplicaReadRequest) returns (ReplicaReadResponse);
+  rpc Merkle(MerkleRequest) returns (MerkleResponse);
+  rpc FetchVersions(FetchVersionsRequest) returns (FetchVersionsResponse);
 }
 
 enum ConsistencyLevel {
@@ -71,7 +74,6 @@ message DeleteResponse {
 message ScanRequest {
   string start_key = 1;
   string end_key = 2;
-  ConsistencyLevel consistency = 3;
 }
 
 message Entry {
@@ -139,4 +141,28 @@ message ReplicaReadResponse {
   bool found = 2;
   ValueVersion version = 3;
   string message = 4;
+  repeated ValueVersion versions = 5;
+}
+
+message ReplicaApplyVersionsRequest {
+  string key = 1;
+  repeated ValueVersion versions = 2;
+}
+
+message MerkleRequest {
+  string start_key = 1;
+  string end_key = 2;
+}
+
+message MerkleResponse {
+  string root_hash = 1;
+  map<string, string> leaf_hashes = 2;
+}
+
+message FetchVersionsRequest {
+  string key = 1;
+}
+
+message FetchVersionsResponse {
+  repeated ValueVersion versions = 1;
 }

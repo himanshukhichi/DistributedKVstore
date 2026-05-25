@@ -3,6 +3,7 @@ package com.distkv.model;
 import java.time.Clock;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -47,14 +48,18 @@ public final class VersionedValue {
         if (other == null) {
             return true;
         }
-        int clockComparison = compareVectorClock(other);
-        if (clockComparison != 0) {
-            return clockComparison > 0;
+        ClockRelation relation = compareVectorClock(other);
+        if (relation == ClockRelation.AFTER) {
+            return true;
+        }
+        if (relation == ClockRelation.BEFORE) {
+            return false;
         }
         return timestampEpochMs > other.timestampEpochMs;
     }
 
-    private int compareVectorClock(VersionedValue other) {
+    public ClockRelation compareVectorClock(VersionedValue other) {
+        Objects.requireNonNull(other, "other");
         boolean greater = false;
         boolean less = false;
         for (String nodeId : unionKeys(other)) {
@@ -67,12 +72,57 @@ public final class VersionedValue {
             }
         }
         if (greater && !less) {
-            return 1;
+            return ClockRelation.AFTER;
         }
         if (less && !greater) {
-            return -1;
+            return ClockRelation.BEFORE;
         }
-        return 0;
+        if (!greater) {
+            return ClockRelation.EQUAL;
+        }
+        return ClockRelation.CONCURRENT;
+    }
+
+    public static VersionedValue latest(List<VersionedValue> values) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        VersionedValue latest = null;
+        for (VersionedValue value : values) {
+            if (!value.tombstone() && value.isNewerThan(latest)) {
+                latest = value;
+            }
+        }
+        return latest;
+    }
+
+    public static VersionedValue latestIncludingTombstone(List<VersionedValue> values) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        VersionedValue latest = null;
+        for (VersionedValue value : values) {
+            if (value.isNewerThan(latest)) {
+                latest = value;
+            }
+        }
+        return latest;
+    }
+
+    public static List<VersionedValue> visible(List<VersionedValue> values) {
+        return values.stream()
+                .filter(value -> !value.tombstone())
+                .toList();
+    }
+
+    public static Map<String, Long> mergeVectorClocks(List<VersionedValue> values, String nodeId, long nextCounter) {
+        Map<String, Long> merged = new LinkedHashMap<>();
+        for (VersionedValue value : values) {
+            value.vectorClock.forEach((clockNodeId, counter) ->
+                    merged.merge(clockNodeId, counter, Math::max));
+        }
+        merged.put(nodeId, Math.max(merged.getOrDefault(nodeId, 0L), nextCounter));
+        return merged;
     }
 
     private Iterable<String> unionKeys(VersionedValue other) {
