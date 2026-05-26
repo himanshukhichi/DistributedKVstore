@@ -1,367 +1,227 @@
-# DistKV Learning Guide: Complete Architecture & Implementation
+# DistKV Learning Guide: SDE-2 Deep Dive
 
-This guide takes you from zero to understanding the entire Distributed KV Store, including every component interaction, data flow, key concepts, and how to test everything.
-
----
-
-## Table of Contents
-
-1. [High-Level Architecture](#high-level-architecture)
-2. [Core Concepts](#core-concepts)
-3. [Layer-by-Layer Breakdown](#layer-by-layer-breakdown)
-4. [Data Flow Examples](#data-flow-examples)
-5. [Testing Strategy](#testing-strategy)
-6. [Running Demos](#running-demos)
-7. [Interview Talking Points](#interview-talking-points)
+The project is intentionally Dynamo-style: it favors availability and eventual convergence using consistent hashing, quorum replication, vector clocks, hinted handoff, gossip membership, anti-entropy repair, WAL durability, and operational metrics.
 
 ---
 
-## High-Level Architecture
+## How To Use This Guide
 
-### System Overview
+Read it in this order if you are preparing for interviews:
 
-DistKV is a **Dynamo-style distributed key-value store**. Imagine it as:
-- **N nodes** in a cluster, each holding a copy of some keys
-- **Every write** goes to **W replicas** (write quorum)
-- **Every read** comes from **R replicas** (read quorum)
-- **R + W > N** guarantees reads always see the most recent writes
+1. Start with the high-level architecture and request flows.
+2. Read the data model and quorum sections before the storage section. Storage makes more sense once you understand why values can have sibling versions.
+3. Read membership, hinted handoff, and anti-entropy together. They are the availability and repair story.
+4. Run the tests after each major topic. The tests are small and are the fastest way to cement the behavior.
+5. Use the "SDE-2 Interview Lens" sections to practice explaining trade-offs, limitations, and improvements.
 
-```
-┌─────────────┐
-│   Client    │
-└──────┬──────┘
-       │ Put("key", "value", QUORUM)
-       ▼
-┌──────────────────────────────┐
-│  Node 1 (Coordinator)        │
-│  - Hash the key              │
-│  - Get preference list [N1,N2,N3] │
-└──────────────────────────────┘
-       │
-   ┌───┼───┐
-   ▼   ▼   ▼
- ┌──┐ ┌──┐ ┌──┐
- │N1│ │N2│ │N3│  ← Fan out in parallel
- └──┘ └──┘ └──┘
-   │   │   │
-   └───┼───┘
-       │ (wait for W=2 acks)
-       ▼
-     SUCCESS
-```
-
-### The 5 Key Layers
-
-| Layer | Purpose | Components |
-|-------|---------|------------|
-| **gRPC API** | Client interface | KVService, AdminService, ReplicaService |
-| **Routing** | Map keys to nodes | Consistent hash ring, preference list |
-| **Replication** | Coordinate across nodes | QuorumCoordinator, replica clients |
-| **Storage** | Persist data locally | WAL, in-memory store, Bloom filter |
-| **Membership** | Track node health | Gossip protocol, failure detection |
+When this guide includes code, the snippet is copied or simplified from the actual project code. Always cross-check the file named above the snippet if you want the exact surrounding context.
 
 ---
 
-## Core Concepts
-
-### 1. Consistent Hashing
-
-**Problem**: When you add/remove a node, you don't want to rehash all keys.
-
-**Solution**: Use a hash ring.
-
-```
-Ring positions: 0 to 2^128
-
-    Node A
-      |
-   ---+---
-  /       \
- /         \  Node B
-|           |
- \    N    /
-  \       /
-   ---+---
-      |
-    Node C
-```
-
-**How it works**:
-- Each node gets `virtualNodes` (default 150) tokens on the ring
-- To find replicas for a key: hash the key → find that position → walk clockwise → collect N distinct *physical* nodes
-
-**Why 150 virtual nodes?**
-- Better load balancing (uniform distribution)
-- When a node fails, fewer keys move to remaining nodes
-- Trade-off: more memory per node to track tokens
-
-**Implementation**: `ConsistentHashRing.java:64-80`
-```java
-List<NodeEndpoint> replicas = ring.getPreferenceList(key, replicationFactor)
-// Returns [Node1, Node2, Node3] in clockwise order
-```
-
-### 2. Quorum Consistency
-
-**Problem**: How many replicas must acknowledge before declaring success?
-
-**Solution**: Configure read/write quorums.
-
-```
-N = 3 (replication factor)
-W = 2 (write quorum: must get 2 acks)
-R = 2 (read quorum: must read from 2 replicas)
-
-R + W > N  →  2 + 2 > 3  ✓ (guarantees overlap)
-```
-
-**Three consistency levels**:
-
-| Level | Write acks needed | Read replicas contacted | Use case |
-|-------|-------------------|------------------------|----------|
-| **ONE** | 1 (fastest) | 1 (fastest) | Cache, non-critical |
-| **QUORUM** | ceil(N/2)+1 = 2 | 2 | Default, good balance |
-| **ALL** | All 3 (slowest) | All 3 (slowest) | Critical data |
-
-**Why R + W > N matters**:
-```
-Scenario: N=3, W=2, R=2
-
-Write to [N1, N2]:
-  N1: key="foo"
-  N2: key="foo"
-  N3: (stale)
-
-Read from [N1, N2]:
-  Will see "foo" on at least one replica
-  Because R + W > N, we must overlap
-```
-
-**Implementation**: `QuorumCoordinator.java:62-96`
-
-### 3. Vector Clocks
-
-**Problem**: If two writes happen on different nodes at roughly the same time, which one is newer?
-
-**Solution**: Track causality with vector clocks.
-
-**Vector Clock**: A map `{nodeId → counter}`
-
-Example sequence:
-```
-Node A writes:  v1 = {A:1}
-Node B writes:  v2 = {B:1}
-Node A writes again: v3 = {A:2, B:1}  ← A learned about B's write
-
-v3 > v1 because {A:2, B:1} dominates {A:1}
-v3 vs v2: CONCURRENT (not ordered)
-```
-
-**Comparison logic** (`VersionedValue.compareVectorClock`):
-- If all counters in v1 ≥ v2 AND at least one > : v1 is AFTER
-- If all counters in v1 ≤ v2 AND at least one < : v1 is BEFORE
-- Otherwise: CONCURRENT (conflict!)
-
-**Conflict handling**:
-- Store both versions as "siblings"
-- Return latest visible value by timestamp to client
-- Application can reconcile (last-write-wins, merge, etc.)
-
-**Implementation**: `VersionedValue.java:47-83`
-
-### 4. Write-Ahead Logging (WAL)
-
-**Problem**: If a node crashes, you lose all in-memory data.
-
-**Solution**: Write to disk BEFORE updating memory.
-
-**WAL Protocol**:
-```
-1. Append(key="x", value="100") to disk file
-   (OS buffers it, will sync to disk)
-
-2. Update in-memory store
-   store.put("x", "100")
-
-3. On crash:
-   - In-memory store is lost
-   - Read WAL file from disk
-   - Replay: put("x", "100")
-   - Recover state!
-```
-
-**Performance optimization**: WAL compaction
-```
-After 10,000 writes:
-- Write a full snapshot to "wal.snapshot"
-- Truncate the WAL log
-- On restart: Load snapshot (fast) + replay remaining WAL
-
-Without compaction: WAL grows unbounded
-```
-
-**Implementation**: `WALManager.java:54-76`
-
-### 5. Bloom Filter
-
-**Problem**: Every Get checks memory. If key doesn't exist, still costs a lookup.
-
-**Solution**: Use a Bloom filter for fast "definitely not here" checks.
-
-**Bloom Filter Basics**:
-- Array of `m` bits, `k` hash functions
-- To insert a key: hash it `k` times, set those bits
-- To check: hash it `k` times, check if all bits are set
-  - All bits set → *might be present* (need to check storage)
-  - At least one bit unset → *definitely not present* (skip storage)
-
-**False positive rate math**:
-```
-m = ceil(-(n * ln(p)) / (ln(2)^2))
-k = round((m / n) * ln(2))
-
-For n=100k keys, p=0.01 (1% false positive):
-m ≈ 958,506 bits ≈ 120 KB
-k ≈ 7 hash functions
-```
-
-**When to use**: Good for read-heavy workloads. Not good if you delete keys often (can't really "delete" from a Bloom filter).
-
-**Implementation**: `BloomFilter.java`
-
-### 6. Hinted Handoff
-
-**Problem**: Node N2 goes down temporarily. Writes meant for N2 fail.
-
-**Solution**: If N2 is down, store the write on the coordinator node as a "hint". When N2 comes back, deliver the hints.
-
-```
-Client write: Put("key", "value", QUORUM)
-Preference list: [N1, N2, N3]
-
-N2 is DOWN:
-  N1 writes locally + stores hint for N2
-  N3 writes
-  (2 acks = QUORUM reached, return success)
-
-N2 comes back alive:
-  Gossip detects N2 is alive
-  N1 sees hints pending for N2
-  N1 delivers hints to N2
-  (N2 now has the value)
-
-This is "sloppy quorum" - quorum is satisfied even if
-one replica was missing, because hint ensures eventual delivery
-```
-
-**Implementation**: `HintedHandoffManager.java`
-
-### 7. Anti-Entropy Repair
-
-**Problem**: If a node was down for a long time, hints alone might not recover all missing writes.
-
-**Solution**: Periodically compare replicas using Merkle trees and sync diverged keys.
-
-```
-Node A Merkle tree:
-  SHA256(key1_version)
-  SHA256(key2_version)
-  ...
-  └─ Root: ABC123
-
-Node B Merkle tree:
-  SHA256(key1_version)
-  SHA256(key2_version)
-  ...
-  └─ Root: XYZ789
-
-Roots differ → trees diverged
-  Walk both trees, find differing leaves
-  For each differing key, fetch versions from A
-  Merge into B
-```
-
-**Implementation**: `MerkleTree.java`, `AntiEntropyService.java`
-
-### 8. Gossip Protocol (Membership)
-
-**Problem**: How do nodes know who is alive without a central coordinator?
-
-**Solution**: Gossip randomly with peers, exchange membership lists.
-
-```
-Every second (default):
-
-1. Node increments its own heartbeat counter
-   local_heartbeat = 5
-
-2. Pick 2 random peers, send:
-   [
-     {nodeId: "node-1", heartbeat: 5, status: ALIVE},
-     {nodeId: "node-2", heartbeat: 3, status: SUSPECT},
-     ...
-   ]
-
-3. Receive their lists, merge:
-   - If remote is newer → accept it
-   - If local is newer → ignore remote
-
-4. Mark nodes SUSPECT if counter hasn't increased in 3 cycles
-   Mark DEAD after 6 cycles
-   Remove from hash ring when DEAD
-```
-
-**Why it works**:
-- Information spreads exponentially (O(log n) rounds)
-- No single point of failure
-- Tolerates network partitions (temporary inconsistency, not data loss)
-
-**Implementation**: `GossipService.java:63-78`, `MembershipList.java`
+## Table Of Contents
+
+1. [Project Map](#project-map)
+2. [Architecture In One Picture](#architecture-in-one-picture)
+3. [Boot Sequence](#boot-sequence)
+4. [API And Wire Contract](#api-and-wire-contract)
+5. [End-To-End Request Flows](#end-to-end-request-flows)
+6. [Routing With Consistent Hashing](#routing-with-consistent-hashing)
+7. [Quorum Replication](#quorum-replication)
+8. [Versioning, Vector Clocks, Conflicts, And Deletes](#versioning-vector-clocks-conflicts-and-deletes)
+9. [Replica RPC Layer](#replica-rpc-layer)
+10. [Storage Engine](#storage-engine)
+11. [WAL Durability And Recovery](#wal-durability-and-recovery)
+12. [Bloom Filter And LRU Eviction](#bloom-filter-and-lru-eviction)
+13. [Membership And Failure Detection](#membership-and-failure-detection)
+14. [Hinted Handoff](#hinted-handoff)
+15. [Anti-Entropy Repair And Merkle Hashing](#anti-entropy-repair-and-merkle-hashing)
+16. [Client Library](#client-library)
+17. [Observability](#observability)
+18. [Deployment And Runtime Configuration](#deployment-and-runtime-configuration)
+19. [Testing Strategy](#testing-strategy)
+20. [Known Limitations And Design Improvements](#known-limitations-and-design-improvements)
+21. [SDE-2 Interview Questions](#sde-2-interview-questions)
+22. [Study Plan](#study-plan)
 
 ---
 
-## Layer-by-Layer Breakdown
+## Project Map
 
-### Layer 1: gRPC API
+The code is organized by distributed-systems responsibility:
 
-**Files**: `KVServiceImpl.java`, `AdminServiceImpl.java`, `ReplicaServiceImpl.java`, `kv.proto`
+| Area | Files | Main responsibility |
+| --- | --- | --- |
+| Protocol/API | `src/main/proto/kv.proto`, `src/main/java/com/distkv/grpc/*` | Defines gRPC services and translates protobuf messages to Java model objects. |
+| Server wiring | `DistKvServer.java` | Reads config, builds ring/store/clients/services, starts gRPC and metrics servers. |
+| Routing | `ConsistentHashRing.java`, `NodeEndpoint.java` | Maps keys to replica nodes using a hash ring and virtual nodes. |
+| Quorum/replication | `QuorumCoordinator.java`, `ReplicaClient.java`, `GrpcReplicaClient.java`, result records | Fans reads/writes to replicas and decides whether quorum succeeded. |
+| Version model | `VersionedValue.java`, `ClockRelation.java` | Carries values, tombstones, timestamps, vector clocks, and conflict comparison logic. |
+| Local storage | `InMemoryKeyValueStore.java`, `WALManager.java`, `BloomFilter.java` | Stores versions locally, logs writes, recovers after restart, filters missing keys, evicts LRU keys. |
+| Membership | `GossipService.java`, `MembershipList.java`, `GrpcGossipPeerClient.java` | Tracks alive/suspect/dead nodes and removes dead nodes from the ring. |
+| Repair | `HintedHandoffManager.java`, `AntiEntropyService.java`, `MerkleTree.java` | Delivers missed writes and periodically syncs divergent replicas. |
+| Client | `DistKvClient.java`, `DistKvDemoClient.java` | Simple Java client with retries, health refresh, and demo commands. |
+| Observability | `DistKvMetrics.java`, `deploy/*`, `docs/images/*` | Prometheus metrics, Grafana dashboard, Docker Compose demo. |
+| Tests | `src/test/java/com/distkv/**` | Unit tests for routing, quorum, storage, WAL, Bloom filter, hinted handoff, and Merkle divergence. |
 
-**What it does**: Handle client RPC calls, fan them out to the routing/replication layer.
+SDE-2 lens:
 
-**Main methods**:
+- Be able to explain the project as separate planes: request/data plane, membership/control plane, repair plane, and observability plane.
+- Be able to identify which classes are pure logic and easy to unit test (`ConsistentHashRing`, `QuorumCalculator`, `BloomFilter`, `MerkleTree`) versus classes that coordinate I/O (`GrpcReplicaClient`, `DistKvServer`, `DistKvClient`).
+- Be able to point out implementation limitations. SDE-2 interviews reward accurate trade-off discussion more than pretending a demo system is production-complete.
+
+---
+
+## Architecture In One Picture
+
+```mermaid
+flowchart LR
+    Client["DistKvClient / grpcurl"] --> KV["KVServiceImpl"]
+    KV --> Fwd{"Is this node the key coordinator?"}
+    Fwd -- "no" --> KV2["KVServiceImpl on coordinator"]
+    Fwd -- "yes" --> Coord["QuorumCoordinator"]
+    KV2 --> Coord
+    Coord --> Ring["ConsistentHashRing"]
+    Ring --> Prefs["Preference list"]
+    Coord --> ReplicaClient["GrpcReplicaClient"]
+    ReplicaClient --> Local["Local store when target is self"]
+    ReplicaClient --> Remote["ReplicaServiceImpl on peer"]
+    Local --> Store["InMemoryKeyValueStore"]
+    Remote --> StorePeer["Peer InMemoryKeyValueStore"]
+    Store --> WAL["WALManager"]
+    StorePeer --> WALPeer["Peer WALManager"]
+    Gossip["GossipService + MembershipList"] --> Ring
+    Hints["HintedHandoffManager"] --> ReplicaClient
+    Repair["AntiEntropyService"] --> Remote
+    Metrics["DistKvMetrics"] --> Prometheus["Prometheus"]
+    Prometheus --> Grafana["Grafana"]
+```
+
+The important idea is that any node can receive a client request, but the system still chooses one coordinator per key. The coordinator is the first node in the key's preference list. That coordinator calculates the replica set and fans out internal replica RPCs.
+
+The layers connect like this:
+
+1. `DistKvClient` chooses a healthy node and sends a gRPC request.
+2. `KVServiceImpl` checks whether this node is the key's coordinator.
+3. If not, it forwards the request to the coordinator node.
+4. `QuorumCoordinator` asks `ConsistentHashRing` for the key's preference list.
+5. `QuorumCoordinator` uses `ReplicaClient` to read/write all replicas.
+6. Each replica applies data through `ReplicaServiceImpl` into `InMemoryKeyValueStore`.
+7. `InMemoryKeyValueStore` appends to `WALManager` before mutating memory.
+8. `GossipService` updates membership and removes dead nodes from future routing.
+9. `HintedHandoffManager` and `AntiEntropyService` repair data after failures.
+
+---
+
+## Boot Sequence
+
+The server starts in `src/main/java/com/distkv/server/DistKvServer.java`. This file is worth reading early because it shows how every component is wired.
+
+### What happens at startup
+
+1. Read environment variables for node id, ports, replication factor, data dir, Bloom filter sizing, WAL compaction, peers, and repair interval.
+2. Build the local `NodeEndpoint`.
+3. Create a `ConsistentHashRing` and add the local node.
+4. Create `WALManager`, `InMemoryKeyValueStore`, and recover from WAL/snapshot.
+5. Start Prometheus metrics HTTP server.
+6. Create `MembershipList` and add static peers to membership and ring.
+7. Create internal replica client, hinted handoff manager, and quorum coordinator.
+8. Start gossip and anti-entropy background services.
+9. Start gRPC server with `KVService`, `AdminService`, and `ReplicaService`.
+10. Announce this node's join to static peers.
+11. Start periodic metrics reporting.
+
+Key wiring snippet from `DistKvServer.java`:
 
 ```java
-// Client-facing RPC
-KVService.Get(GetRequest) → GetResponse
-KVService.Put(PutRequest) → PutResponse
-KVService.Delete(DeleteRequest) → DeleteResponse
-KVService.Scan(ScanRequest with ConsistencyLevel) → stream Entry
+ConsistentHashRing ring = new ConsistentHashRing();
+ring.addNode(localEndpoint);
 
-AdminService.ClusterStatus() → ClusterStatusResponse
-AdminService.NodeJoin(node) → NodeJoinResponse
-AdminService.NodeLeave(nodeId) → NodeLeaveResponse
+WALManager walManager = new WALManager(dataDir.resolve("wal.log"), walCompactionWrites);
+InMemoryKeyValueStore store = new InMemoryKeyValueStore(
+        clock,
+        walManager,
+        maxEntries,
+        maxMemoryBytes,
+        new BloomFilter(bloomExpectedInsertions, bloomFalsePositiveRate));
+store.recoverFromWal();
 
-// Node-to-node RPC (internal)
-ReplicaService.Apply(key, version) → success
-ReplicaService.Read(key) → versions
-ReplicaService.Merkle(startKey, endKey) → root_hash + leaf_hashes
+GrpcReplicaClient replicaClient = new GrpcReplicaClient(localEndpoint, store, Duration.ofMillis(500));
+HintedHandoffManager hintedHandoffManager = new HintedHandoffManager(replicaClient, Duration.ofSeconds(2));
+
+QuorumCoordinator coordinator = new QuorumCoordinator(
+        nodeId,
+        ring,
+        replicaClient,
+        replicationFactor,
+        Duration.ofMillis(750),
+        clock,
+        hintedHandoffManager);
 ```
 
-**Key point**: The gRPC layer **translates** between Protocol Buffers (wire format) and Java objects (`VersionedValue`, `NodeEndpoint`, etc.). All KV requests carry `ConsistencyLevel`; Scan keeps the field for API symmetry but streams a local range from the contacted node.
+Why this matters:
 
-The Java client exposes both `scanStreaming(...)`, which returns an `Iterator<Entry>` over the server stream, and `scan(...)`, which collects that stream into a list for simple demos.
+- `WALManager` exists before the store accepts writes, so recovery is part of startup.
+- `GrpcReplicaClient` knows the local endpoint and local store. This lets it bypass gRPC when the target replica is the local node.
+- `QuorumCoordinator` owns the request-level timeout. The replica client owns per-RPC deadlines.
+- Hinted handoff is injected into the coordinator, so only failed write attempts create hints.
 
-**Example flow** (`KVServiceImpl.put()`):
+SDE-2 lens:
+
+- This is dependency injection by constructors, not a framework. It is easy to test because core classes can be built with fake clocks and local fake clients.
+- The server uses Java 21 virtual threads for gRPC handlers:
+
+```java
+ExecutorService grpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+Server server = ServerBuilder.forPort(port)
+        .executor(grpcExecutor)
+        .addService(kvService)
+        .addService(new AdminServiceImpl(membershipList, ring))
+        .addService(new ReplicaServiceImpl(store))
+        .build()
+        .start();
 ```
-1. Receive PutRequest(key, value, consistency)
-2. If this node is not first in the key's preference list, forward to that coordinator
-3. Call coordinator.put(key, value, consistency)
-4. Get WriteQuorumResult
-5. Convert to PutResponse
-6. Return to client
+
+Virtual threads are a good fit here because request handlers may block on quorum futures, local WAL appends, and blocking gRPC stubs.
+
+---
+
+## API And Wire Contract
+
+The wire contract lives in `src/main/proto/kv.proto`.
+
+### Services
+
+```protobuf
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (stream Entry);
+}
+
+service AdminService {
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc NodeJoin(NodeJoinRequest) returns (NodeJoinResponse);
+  rpc NodeLeave(NodeLeaveRequest) returns (NodeLeaveResponse);
+}
+
+service ReplicaService {
+  rpc Apply(ReplicaApplyRequest) returns (ReplicaApplyResponse);
+  rpc ApplyVersions(ReplicaApplyVersionsRequest) returns (ReplicaApplyResponse);
+  rpc Read(ReplicaReadRequest) returns (ReplicaReadResponse);
+  rpc Merkle(MerkleRequest) returns (MerkleResponse);
+  rpc FetchVersions(FetchVersionsRequest) returns (FetchVersionsResponse);
+}
 ```
 
-**Data model** (in `.proto`):
+There are three APIs because the system has three audiences:
+
+- `KVService`: external client operations.
+- `AdminService`: cluster membership and status.
+- `ReplicaService`: internal node-to-node data replication and repair.
+
+### Value shape
+
 ```protobuf
 message ValueVersion {
   bytes value = 1;
@@ -369,915 +229,1901 @@ message ValueVersion {
   map<string, int64> vector_clock = 3;
   bool tombstone = 4;
 }
+```
 
-ConsistencyLevel {
+Every value carries:
+
+- raw bytes, so the system is not tied to strings or JSON;
+- timestamp, used as a tiebreaker when vector clocks are equal or concurrent;
+- vector clock, used for causality and conflict detection;
+- tombstone flag, used for deletes without immediately forgetting older versions.
+
+### Consistency levels
+
+```protobuf
+enum ConsistencyLevel {
   ONE = 0;
   QUORUM = 1;
   ALL = 2;
 }
 ```
 
-### Layer 2: Routing (Consistent Hash Ring)
+`Get`, `Put`, `Delete`, and `Scan` carry consistency. In the current implementation, `Get`, `Put`, and `Delete` use it for quorum math. `Scan` carries the field for API symmetry but scans only the contacted node's local store.
 
-**Files**: `ConsistentHashRing.java`, `NodeEndpoint.java`
+### Mapping between protobuf and Java
 
-**What it does**: Map a key to a list of replica nodes.
-
-**Key methods**:
+`src/main/java/com/distkv/grpc/ProtoMappers.java` is intentionally small:
 
 ```java
-ring.addNode(NodeEndpoint)           // Add node with 150 virtual tokens
-ring.removeNode(nodeId)              // Remove when node dies
-ring.getPreferenceList(key, 3)       // [N1, N2, N3] in ring order
-ring.getCoordinator(key)             // N1 (first replica)
-```
+public static ValueVersion toProto(VersionedValue value) {
+    return ValueVersion.newBuilder()
+            .setValue(ByteString.copyFrom(value.value()))
+            .setTimestampEpochMs(value.timestampEpochMs())
+            .putAllVectorClock(value.vectorClock())
+            .setTombstone(value.tombstone())
+            .build();
+}
 
-The first node in the preference list is the coordinator for Get/Put/Delete. The Java client still picks a random healthy node, so a non-coordinator node forwards the request to the correct coordinator before the quorum fan-out.
-
-**Ring structure**:
-```
-NavigableMap<BigInteger, NodeEndpoint> ring
-├─ Token: hash("node-1#0")   → node-1
-├─ Token: hash("node-1#1")   → node-1
-├─ Token: hash("node-1#2")   → node-1
-│  ...
-├─ Token: hash("node-2#0")   → node-2
-│  ...
-└─ Token: hash("node-3#0")   → node-3
-```
-
-**Lookup algorithm** (O(log n)):
-```
-To find replicas for "mykey":
-  1. token = hash("mykey")
-  2. ring.tailMap(token, true)  → tokens ≥ token
-     Collect first distinct physical nodes
-  3. If still need more, ring.headMap(token, false) → wrap around
-```
-
-**Why MD5 hashing?**
-- Distributes keys uniformly
-- Deterministic (same key always hashes to same position)
-- Fast enough (thousands of hashes per second)
-
-### Layer 3: Replication (Quorum Coordinator)
-
-**Files**: `QuorumCoordinator.java`, `QuorumCalculator.java`, `ReplicaClient.java` (interface), `GrpcReplicaClient.java`, `LocalReplicaClient.java`
-
-**What it does**: Orchestrate reads/writes across replicas, wait for quorum acks.
-
-**Key methods**:
-
-```java
-coordinator.put(key, value, QUORUM)    // Write with quorum
-coordinator.get(key, QUORUM)           // Read with quorum
-coordinator.delete(key, QUORUM)        // Delete (tombstone) with quorum
-```
-
-**Put flow**:
-
-```java
-public WriteQuorumResult put(String key, byte[] value, ConsistencyLevel level) {
-  1. Create VersionedValue:
-     version = VersionedValue.put(value, "node-1", counter++, clock)
-     // {nodeId: "node-1", counter: 42, timestamp: 1234567890}
-
-  2. Get replicas:
-     replicas = ring.getPreferenceList(key, replicationFactor=3)
-     // [N1, N2, N3]
-
-  3. Send to all in parallel:
-     futures = [
-       replicaClient.write(N1, key, version),
-       replicaClient.write(N2, key, version),
-       replicaClient.write(N3, key, version),
-     ]
-
-  4. Wait for W acks:
-     requiredAcks = QuorumCalculator.requiredAcks(3, QUORUM) = 2
-     acks = 0
-     for future in futures:
-       if future.get(timeout):
-         acks++
-       if acks >= requiredAcks:
-         return SUCCESS
-
-  5. If hinted handoff enabled and a replica was down:
-     hintedHandoff.store(unreachableNode, key, version)
+public static VersionedValue fromProto(ValueVersion value) {
+    Map<String, Long> vectorClock = new LinkedHashMap<>(value.getVectorClockMap());
+    return new VersionedValue(
+            value.getValue().toByteArray(),
+            value.getTimestampEpochMs(),
+            vectorClock,
+            value.getTombstone());
 }
 ```
 
-**Get flow**:
+Why use mapper classes:
 
-```java
-public ReadQuorumResult get(String key, ConsistencyLevel level) {
-  1. Get replicas: [N1, N2, N3]
-
-  2. Read from all in parallel:
-     futures = [
-       replicaClient.read(N1, key),
-       replicaClient.read(N2, key),
-       replicaClient.read(N3, key),
-     ]
-
-  3. Collect responses:
-     versions = []
-     responses = 0
-     for future in futures:
-       if future.get(timeout):
-         responses++
-         versions.addAll(future.result.versions)
-
-  4. Check if quorum reached:
-     requiredResponses = QuorumCalculator.requiredResponses(3, QUORUM) = 2
-     if responses < 2:
-       return ERROR
-
-  5. Return newest non-tombstone version:
-     latest = VersionedValue.latest(versions)
-     return latest
-}
-```
-
-**Quorum Math** (`QuorumCalculator.java`):
-
-```java
-N = 3
-
-ONE:    W = 1, R = 1   (any single node)
-QUORUM: W = 2, R = 2   (majority)
-ALL:    W = 3, R = 3   (all nodes)
-
-ONE + ONE = 2, NOT > 3  → Can read stale data ✓ (expected)
-QUORUM + QUORUM = 4 > 3 → Always overlap ✓
-ALL + ALL = 6 > 3      → Always overlap ✓
-```
-
-### Layer 4: Storage (WAL + In-Memory Store)
-
-**Files**: `WALManager.java`, `InMemoryKeyValueStore.java`, `BloomFilter.java`, `StoredEntry.java`
-
-**What it does**: Persist and retrieve key-value pairs durably.
-
-The in-memory store is synchronized around mutations and backed by a `ConcurrentHashMap`; the gRPC server uses Java 21 virtual threads for request handlers, so blocking quorum fan-out and WAL work do not consume a fixed platform-thread pool.
-
-**Key methods**:
-
-```java
-store.put(key, value)              // Add to memory + WAL
-store.get(key)                     // Read from memory
-store.delete(key)                  // Mark as deleted in memory + WAL
-store.scan(startKey, endKey)       // Range scan
-```
-
-**Put operation** (write-ahead log):
-
-```java
-public void put(String key, byte[] value) throws IOException {
-  1. Append to WAL:
-     walManager.append(key, value)
-     // Writes to disk (or kernel buffer)
-
-  2. Update memory:
-     concurrentStore.put(key, value)
-}
-```
-
-**Get operation** (with Bloom filter):
-
-```java
-public byte[] get(String key) {
-  1. Check Bloom filter:
-     if (!bloomFilter.contains(key)) {
-       return null;  // Definitely not here
-     }
-
-  2. Check in-memory store:
-     return concurrentStore.get(key)
-}
-```
-
-**Scan operation** (range query):
-
-```java
-public Stream<Entry> scan(String startKey, String endKey) {
-  // Returns all keys in [startKey, endKey) sorted
-  return concurrentStore.entrySet()
-    .stream()
-    .filter(e -> e.key >= startKey && e.key < endKey)
-    .sorted();
-}
-```
-
-**LRU capacity controls**:
-- `DISTKV_MAX_ENTRIES` caps the number of keys.
-- `DISTKV_MAX_MEMORY_BYTES` caps approximate in-memory bytes and evicts least-recently-used keys when the estimate is exceeded.
-
-**Restart recovery**:
-
-```java
-public void recover() throws IOException {
-  // On server startup
-  1. Load snapshot:
-     latestSnapshot = walManager.loadSnapshot()
-     // Bulk load previous state
-
-  2. Replay WAL delta:
-     latestSnapshot.putAll(walManager.replayWalDelta())
-     // Apply changes since snapshot
-
-  3. Restore to store:
-     concurrentStore.putAll(latestSnapshot)
-}
-```
-
-**WAL Compaction** (to prevent unbounded growth):
-
-```
-After 10,000 writes (configurable):
-  1. Write snapshot file (full state)
-  2. Truncate WAL
-  3. On next restart: load snapshot + smaller WAL delta
-```
-
-### Layer 5: Membership & Failure Detection
-
-**Files**: `GossipService.java`, `MembershipList.java`, `MemberInfo.java`, `GrpcGossipPeerClient.java`
-
-**What it does**: Track which nodes are alive, remove dead nodes from the ring.
-
-**Key methods**:
-
-```java
-gossip.start()                    // Start gossip loop
-gossip.gossipOnce()               // Execute one gossip round
-membershipList.addNode(endpoint)  // Add node
-membershipList.markFailures()     // Detect and mark dead nodes
-```
-
-**Gossip round** (every 1 second):
-
-```java
-public void gossipOnce() {
-  1. Increment own heartbeat:
-     membershipList.incrementLocalHeartbeat()
-     // "I'm alive, counter=5"
-
-  2. Pick 2 random peers:
-     peers = membershipList.healthyPeers()
-     Collections.shuffle(peers)
-     peers = peers.stream().limit(fanout=2)
-
-  3. Exchange membership:
-     for peer in peers:
-       remoteList = peerClient.exchange(peer, localList)
-       // Send: [{node-1, hb=5}, {node-2, hb=3}, ...]
-       // Receive: [{node-1, hb=4}, {node-3, hb=2}, ...]
-
-       membershipList.merge(remoteList)
-
-  4. Detect failures:
-     deadNodes = membershipList.markFailures(
-       interval=1s,
-       suspectAfterCycles=3,
-       deadAfterCycles=6
-     )
-     // If no increase for 3 cycles: SUSPECT
-     // If no increase for 6 cycles: DEAD
-
-  5. Update hash ring:
-     for deadNode in deadNodes:
-       ring.removeNode(deadNode.nodeId())
-       // Rebalance future writes away from dead node
-}
-```
-
-**State transitions**:
-
-```
-ALIVE → (no heartbeat for 3 cycles) → SUSPECT
-                                       ↓ (no heartbeat for 3 more cycles)
-                                     DEAD (removed from ring)
-                                       ↑
-                                  (heartbeat received)
-                                    ALIVE again
-```
+- Protobuf generated classes are transport objects.
+- Java domain records/classes express system logic.
+- Keeping conversion explicit avoids spreading protobuf dependencies into every layer.
 
 ---
 
-## Data Flow Examples
+## End-To-End Request Flows
 
-### Example 1: Put with QUORUM
+### Put flow
 
-**Setup**: 3-node cluster, N=3, W=2, R=2, replication factor=3
+For `put("user:100", value, QUORUM)`:
 
-**Scenario**: Client calls `put("user:100", "Alice", QUORUM)`
+1. Client chooses a healthy node and calls `KVService/Put`.
+2. `KVServiceImpl` checks whether this node is the key coordinator.
+3. If not coordinator, it forwards the same request to the key coordinator.
+4. Coordinator creates a `VersionedValue` with its node id and local counter.
+5. Coordinator asks the ring for the key's replica list.
+6. Coordinator sends the write to every replica in the list.
+7. Each replica appends to its WAL, merges the version into memory, updates LRU/Bloom state, and maybe compacts WAL.
+8. Coordinator counts acknowledgements.
+9. If acknowledgements meet the selected consistency level, client gets success.
+10. Failed write attempts are stored as hints for later retry.
 
-```
-Client                Node1 (Coordinator)    Node2          Node3
-  │                        │                  │              │
-  │ Put request            │                  │              │
-  ├──────────────────────>  │                  │              │
-  │                        │                  │              │
-  │                    Hash key "user:100"    │              │
-  │                    Get prefs: [N1,N2,N3]  │              │
-  │                        │                  │              │
-  │                    Create version:        │              │
-  │                    {value: "Alice",       │              │
-  │                     nodeId: "N1",         │              │
-  │                     counter: 42,          │              │
-  │                     ts: 1000}             │              │
-  │                        │                  │              │
-  │                    Send Apply RPCs in parallel:
-  │                        │                  │              │
-  │                    Apply to local store   │              │
-  │                    Append to WAL          │              │
-  │                    Return ack             │              │
-  │                        │──────────────────>              │
-  │                        │ Apply RPC        │              │
-  │                        │                  │ Append to WAL │
-  │                        │                  │ Return ack   │
-  │                        │                  ├──────────────>
-  │                        │                  │              │
-  │                        │ (Wait for W=2 acks)            │ Append to WAL
-  │                        │ ack1: ✓ from N1  │              │ Return ack
-  │                        │ ack2: ✓ from N2  │              │
-  │                        │ ack3: ✗ timeout  │              │
-  │                        │                  │              │
-  │                        │ Acks >= W (2), SUCCESS!         │
-  │                        │ Store hint for N3 (down)        │
-  │                        │                  │              │
-  │ Put response SUCCESS   │                  │              │
-  │ <──────────────────────┤                  │              │
-  │
-  │ (moments later, N3 comes back)
-  │
-  │                   Gossip detects N3 alive
-  │                   Send pending hint to N3
-  │                        │                  │              │
-  │                        │                  │              │
-  │                    Apply hint RPC         │              │
-  │                        │──────────────────────────────>  │
-  │                        │                  │              │
-  │                        │                  │              │
-  │                        │                  │   Apply version
-  │                        │                  │   (now all 3 have it)
+Forwarding snippet from `KVServiceImpl.java`:
+
+```java
+Optional<NodeEndpoint> remoteCoordinator = remoteCoordinatorFor(request.getKey());
+if (remoteCoordinator.isPresent()) {
+    responseObserver.onNext(forwardStub(remoteCoordinator.get()).put(request));
+    responseObserver.onCompleted();
+    return;
+}
+
+WriteQuorumResult result = record("put", () -> coordinator.put(
+        request.getKey(),
+        request.getValue().toByteArray(),
+        request.getConsistency()));
 ```
 
-**Result**: Key "user:100" is replicated on N1, N2, and N3 with same version.
+Why forward:
+
+- The client can talk to any healthy node.
+- The system still wants a stable coordinator for a key.
+- Stable coordination reduces the chance that normal writes to the same key create independent vector-clock branches.
+
+### Get flow
+
+For `get("user:100", QUORUM)`:
+
+1. Client calls any node.
+2. Non-coordinator forwards to coordinator.
+3. Coordinator asks the ring for replicas.
+4. Coordinator sends `ReplicaService/Read` to all replicas.
+5. Replica returns all versions it has for that key, including tombstones.
+6. Coordinator merges the returned versions using vector clocks.
+7. If enough replicas responded, the read succeeds.
+8. If the newest merged version is a tombstone, response is `found=false`.
+9. If there are multiple visible siblings, response includes all versions and message says conflict.
+
+Read merge in `QuorumCoordinator.java`:
+
+```java
+int responses = 0;
+List<VersionedValue> mergedVersions = List.of();
+long deadline = System.nanoTime() + timeout.toNanos();
+for (CompletableFuture<ReplicaReadResult> future : futures) {
+    Optional<ReplicaReadResult> result = await(future, deadline);
+    if (result.isEmpty() || !result.get().responded()) {
+        continue;
+    }
+    responses++;
+    for (VersionedValue version : result.get().versions()) {
+        mergedVersions = mergeVersions(mergedVersions, version);
+    }
+}
+```
+
+Important nuance:
+
+- The coordinator sends to all replicas, not only the minimum `R`.
+- It uses one shared deadline and then decides whether enough responses arrived.
+- It does not perform synchronous read repair. Stale replicas are repaired later by anti-entropy.
+
+### Delete flow
+
+Delete is implemented as a write of a tombstone:
+
+```java
+public WriteQuorumResult delete(String key, ConsistencyLevel consistencyLevel) {
+    VersionedValue version = VersionedValue.tombstone(
+            coordinatorNodeId,
+            localCounter.incrementAndGet(),
+            clock);
+    return write(key, version, consistencyLevel);
+}
+```
+
+Why tombstones:
+
+- If you physically remove the key immediately, an old replica that missed the delete could later reintroduce the value during repair.
+- A tombstone is a version that says "the latest known state is deleted."
+- Anti-entropy can replicate tombstones just like values.
+
+Current limitation:
+
+- There is no tombstone garbage collection. A production system would delete tombstones only after it is safe that all replicas have seen them.
+
+### Scan flow
+
+`Scan` is server-side streaming:
+
+```java
+localStore.scan(request.getStartKey(), request.getEndKey()).forEach(entry -> responseObserver.onNext(
+        Entry.newBuilder()
+                .setKey(entry.key())
+                .setVersion(ProtoMappers.toProto(entry.value()))
+                .build()));
+```
+
+Important nuance:
+
+- Scan is local only.
+- It does not ask the consistent hash ring for all key ranges.
+- It does not merge scan results across replicas.
+- For a production distributed scan, you would need token-range ownership, pagination, per-range replica selection, retries, and merge/de-duplication.
 
 ---
 
-### Example 2: Get with QUORUM (Conflict Scenario)
+## Routing With Consistent Hashing
 
-**Setup**: Same cluster, but data has conflicts.
+Routing answers one question: for a key, which nodes should store it?
 
-**State before**:
-- N1: `user:100` = {value: "Alice", clock: {N1:10}}, ts: 1000
-- N2: `user:100` = {value: "Bob", clock: {N2:5}}, ts: 1100 (concurrent write, never merged)
-- N3: `user:100` = {value: "Alice", clock: {N1:10}}, ts: 1000
+DistKV uses a consistent hash ring in `src/main/java/com/distkv/routing/ConsistentHashRing.java`.
 
-**Client calls**: `get("user:100", QUORUM)`
+### Why consistent hashing
 
-```
-Client                N1                   N2                N3
-  │                   │                    │                 │
-  │ Get request       │                    │                 │
-  ├──────────────────>│                    │                 │
-  │                   │                    │                 │
-  │                   Hash key, get prefs: [N1, N2, N3]      │
-  │                   Send Read RPCs in parallel:            │
-  │                   │ Read RPC           │                 │
-  │                   ├──────────────────>│                 │
-  │                   │                    │                 │
-  │                   │        (also send to N2 and N3)      │
-  │                   │                    │                 │
-  │ (Wait for R=2 responses)               │                 │
-  │                   │ Response: {       │ Response:       │ Response:
-  │                   │   value: "Alice", │   value: "Bob", │   value: "Alice",
-  │                   │   clock: {N1:10}  │   clock: {N2:5} │   clock: {N1:10}
-  │                   │ }                 │ }               │ }
-  │                   │ ack1: ✓           │ ack2: ✓         │
-  │                   │                    │                 │
-  │                   │ Merge versions:    │                 │
-  │                   │ {N1:10} vs {N2:5}  │                 │
-  │                   │ N1:10 > N2:5 → AFTER (newer)        │
-  │                   │                    │                 │
-  │                   │ But we got both, so CONFLICT!        │
-  │                   │                    │                 │
-  │ Get response      │                    │                 │
-  │ {found: true,    │                    │                 │
-  │  versions: [     │                    │                 │
-  │    {value: "Alice", clock: {N1:10}},  │                 │
-  │    {value: "Bob", clock: {N2:5}}      │                 │
-  │  ],               │                    │                 │
-  │  message: "conflict: sibling versions"}                 │
-  │ <──────────────────┤                    │                 │
-  │
-  │ Client application can:
-  │ - Use last-write-wins (pick {N1:10})
-  │ - Merge ("Alice" + "Bob")
-  │ - Show to user (conflict resolution)
+Naive approach:
+
+```text
+nodeIndex = hash(key) % numberOfNodes
 ```
 
-**Result**: Client gets both versions, knows there's a conflict.
+Problem: when the node count changes, `numberOfNodes` changes, so most keys map to different nodes. That creates huge data movement.
 
-**Why both versions exist**: The system didn't coordinate the merge because:
-- Write from N1 went to N1, N2, N3
-- Write from N2 went to only N2 (others didn't reach it)
-- N3 kept N1's version
-- No one knows the "true" order, so both are kept
+Consistent hashing maps both nodes and keys into a fixed hash space. When a node joins or leaves, only the neighboring ranges move.
+
+### Virtual nodes
+
+Each physical node receives many positions on the ring:
+
+```java
+public static final int DEFAULT_VIRTUAL_NODES = 150;
+
+for (int index = 0; index < virtualNodes; index++) {
+    BigInteger token = hash(node.nodeId() + "#" + index);
+    ring.put(token, node);
+    tokens.add(token);
+}
+```
+
+Why virtual nodes:
+
+- Better distribution than one token per physical node.
+- Smaller hot ranges.
+- Less skew when a node joins or leaves.
+- Easy way to give stronger machines more tokens in a future version.
+
+Trade-off:
+
+- More tokens mean more memory and slightly more ring maintenance work.
+- Lookup remains efficient because the ring is a `TreeMap`.
+
+### Preference list lookup
+
+The preference list is the ordered list of replicas for a key. If replication factor is 3, the coordinator wants 3 distinct physical nodes.
+
+Core code:
+
+```java
+BigInteger keyHash = hash(key);
+List<NodeEndpoint> result = new ArrayList<>(Math.min(replicaCount, physicalNodes.size()));
+LinkedHashSet<String> seenPhysicalNodes = new LinkedHashSet<>();
+
+collectDistinctNodes(ring.tailMap(keyHash, true).values(), replicaCount, result, seenPhysicalNodes);
+if (result.size() < replicaCount) {
+    collectDistinctNodes(ring.headMap(keyHash, false).values(), replicaCount, result, seenPhysicalNodes);
+}
+return List.copyOf(result);
+```
+
+How it works:
+
+1. Hash the key into the same MD5 hash space as node tokens.
+2. Walk clockwise from the key hash using `tailMap`.
+3. Collect distinct physical nodes, not just tokens.
+4. If the end of the ring is reached, wrap to the start with `headMap`.
+5. Return at most `min(replicaCount, livePhysicalNodeCount)` nodes.
+
+Why distinct physical nodes:
+
+- A node has 150 virtual tokens.
+- Without `seenPhysicalNodes`, the first 3 tokens might all belong to the same physical node.
+- Replication would then be fake redundancy.
+
+### Coordinator selection
+
+The first node in the preference list is the coordinator:
+
+```java
+public synchronized Optional<NodeEndpoint> getCoordinator(String key) {
+    return getPreferenceList(key, 1).stream().findFirst();
+}
+```
+
+`KVServiceImpl` uses this to forward requests. That gives the project a coordinator pattern without having a central leader.
+
+### SDE-2 interview lens
+
+Be ready to explain these points:
+
+- Consistent hashing reduces remapping on membership changes.
+- Virtual nodes reduce imbalance.
+- A preference list is different from a coordinator. The coordinator is just the first replica for a key.
+- When the ring has fewer live nodes than the configured replication factor, this implementation returns fewer replicas. That improves availability, but quorum math is then calculated over the current replica list size, not the original configured `N`.
 
 ---
 
-### Example 3: Node Failure & Gossip Detection
+## Quorum Replication
 
-**Setup**: 3-node cluster, N1 runs normally, then N2 crashes.
+Quorum replication answers: how many replicas must respond before the operation is considered successful?
 
+The core classes:
+
+- `src/main/java/com/distkv/quorum/QuorumCalculator.java`
+- `src/main/java/com/distkv/replication/QuorumCoordinator.java`
+- `src/main/java/com/distkv/replication/ReplicaClient.java`
+
+### Consistency math
+
+`QuorumCalculator` maps levels to required responses:
+
+```java
+public static int requiredResponses(int replicationFactor, ConsistencyLevel consistencyLevel) {
+    if (replicationFactor < 1) {
+        throw new IllegalArgumentException("replicationFactor must be positive");
+    }
+    return switch (consistencyLevel) {
+        case ONE, UNRECOGNIZED -> 1;
+        case QUORUM -> (replicationFactor / 2) + 1;
+        case ALL -> replicationFactor;
+    };
+}
 ```
-Time  N1 heartbeat  N2 heartbeat  N3 heartbeat  N2 Status
-───────────────────────────────────────────────────────
-  0      0             0              0          ALIVE
-  1      1             1              1          ALIVE
-  2      2             2              2          ALIVE
-  3      3             ✗              3          ALIVE (1st miss)
-  4      4             ✗              4          ALIVE (2nd miss)
-  5      5             ✗              5          SUSPECT (3 cycles)
-  6      6             ✗              6          SUSPECT (4 cycles)
-  7      7             ✗              7          DEAD (6 cycles, removed)
-  8      8             ✗              8          (not in ring anymore)
+
+For 3 replicas:
+
+| Level | Required responses | Latency | Availability | Staleness risk |
+| --- | ---: | --- | --- | --- |
+| ONE | 1 | Lowest | Highest | Highest |
+| QUORUM | 2 | Medium | Medium | Lower |
+| ALL | 3 | Highest | Lowest | Lowest |
+
+Classic quorum property:
+
+```text
+R + W > N
 ```
 
-**Meanwhile, consistent hash ring updates**:
+If read quorum `R` and write quorum `W` overlap, at least one node read by the read operation must have acknowledged the latest successful write.
 
+Important nuance for this project:
+
+```java
+List<NodeEndpoint> replicas = replicasFor(key);
+int requiredAcks = QuorumCalculator.requiredResponses(replicas.size(), consistencyLevel);
 ```
-Step 1: N2 removed from ring
-   Before:  prefs for "key" = [N1, N2, N3]
-   After:   prefs for "key" = [N1, N3, ???] (only 2 nodes, replication factor=3)
 
-Step 2: New writes happen
-   Put("newkey", "value")
-   Prefs: [N1, N3]
-   (can only reach 2 of 3 replicas, but quorum W=2, so QUORUM still succeeds)
+The coordinator uses `replicas.size()`, not always the configured replication factor. If one node has been removed from the ring and only 2 replicas are available, `QUORUM` requires 2 responses. This helps the demo keep working during failures, but the strict `R + W > original N` guarantee should be discussed carefully.
 
-Step 3: N2 comes back
-   Gossip detects N2 alive
-   Anti-entropy repair compares N2 vs N1:
-   - N2 missing "newkey"
-   - Fetch from N1, apply to N2
-   - N2 now caught up
+### Write path
 
-Step 4: N2 added back to ring
-   Prefs for "key" = [N1, N2, N3] again
+The write path creates a version and fans out to all replicas:
+
+```java
+public WriteQuorumResult put(String key, byte[] value, ConsistencyLevel consistencyLevel) {
+    VersionedValue version = VersionedValue.put(
+            value,
+            coordinatorNodeId,
+            localCounter.incrementAndGet(),
+            clock);
+    return write(key, version, consistencyLevel);
+}
+```
+
+The actual write orchestration:
+
+```java
+List<NodeEndpoint> replicas = replicasFor(key);
+int requiredAcks = QuorumCalculator.requiredResponses(replicas.size(), consistencyLevel);
+List<ReplicaWriteAttempt> attempts = replicas.stream()
+        .map(node -> new ReplicaWriteAttempt(node, replicaClient.write(node, key, version)))
+        .toList();
+
+int acks = 0;
+long deadline = System.nanoTime() + timeout.toNanos();
+for (ReplicaWriteAttempt attempt : attempts) {
+    Optional<ReplicaWriteResult> result = await(attempt.future(), deadline);
+    if (result.isPresent() && result.get().acknowledged()) {
+        acks++;
+    } else if (hintedHandoffManager != null) {
+        hintedHandoffManager.storeHint(attempt.node(), key, version);
+    }
+}
+```
+
+Important nuance:
+
+- It sends to all replicas.
+- It does not return as soon as quorum is reached.
+- It waits up to the shared deadline while iterating through all attempts.
+- A failed target gets a hint.
+- The write succeeds only if actual acknowledgements meet the threshold. A stored hint does not count as an acknowledgement.
+
+Why fan out to all replicas:
+
+- Maximizes the chance all replicas are fresh.
+- Reduces later repair work.
+- Still allows the client to succeed if only the selected quorum responds.
+
+Trade-off:
+
+- Waiting for all futures until deadline can increase tail latency compared with returning immediately after quorum.
+- A production coordinator often returns once quorum succeeds while allowing late responses or background repair to continue.
+
+### Read path
+
+Reads are similar: send to all replicas, merge all versions that arrive before the shared deadline, then check response count.
+
+```java
+boolean quorumReached = responses >= requiredResponses;
+if (!quorumReached) {
+    return new ReadQuorumResult(false, responses, List.of(),
+            "read quorum failed: required " + requiredResponses + " responses but received " + responses);
+}
+
+VersionedValue latest = VersionedValue.latestIncludingTombstone(mergedVersions);
+if (latest == null || latest.tombstone()) {
+    return new ReadQuorumResult(true, responses, mergedVersions, "not found");
+}
+return new ReadQuorumResult(true, responses, mergedVersions,
+        mergedVersions.size() > 1 ? "conflict: returned sibling versions" : "found");
+```
+
+Why return siblings:
+
+- The storage layer may contain multiple concurrent versions.
+- The read response exposes them to the client rather than silently overwriting.
+
+Current limitation:
+
+- The project does not accept a client-supplied vector clock on `Put`, so clients cannot explicitly resolve siblings through the public API.
+- Normal writes to the same key usually go through the same coordinator because of forwarding. That reduces conflicts but does not eliminate them under coordinator changes or direct replica writes.
+
+---
+
+## Versioning, Vector Clocks, Conflicts, And Deletes
+
+The most important model class is `src/main/java/com/distkv/model/VersionedValue.java`.
+
+```java
+public final class VersionedValue {
+    private final byte[] value;
+    private final long timestampEpochMs;
+    private final Map<String, Long> vectorClock;
+    private final boolean tombstone;
+}
+```
+
+### Why version values
+
+Distributed systems cannot always know the "real" order of events:
+
+- Node A accepts a write during a partition.
+- Node B accepts another write for the same key during the same partition.
+- Both writes may later meet during read or repair.
+
+If neither write saw the other, they are concurrent. Overwriting one would lose data.
+
+### Vector clock comparison
+
+Vector clocks are maps like:
+
+```text
+{ "node-1": 7, "node-2": 3 }
+```
+
+The rule:
+
+- If every counter in A is greater than or equal to B and at least one is greater, A is after B.
+- If every counter in A is less than or equal to B and at least one is less, A is before B.
+- If some counters are greater and some are less, they are concurrent.
+- If all counters are equal, they are equal.
+
+Implementation:
+
+```java
+public ClockRelation compareVectorClock(VersionedValue other) {
+    boolean greater = false;
+    boolean less = false;
+    for (String nodeId : unionKeys(other)) {
+        long left = vectorClock.getOrDefault(nodeId, 0L);
+        long right = other.vectorClock.getOrDefault(nodeId, 0L);
+        if (left > right) {
+            greater = true;
+        } else if (left < right) {
+            less = true;
+        }
+    }
+    if (greater && !less) {
+        return ClockRelation.AFTER;
+    }
+    if (less && !greater) {
+        return ClockRelation.BEFORE;
+    }
+    if (!greater) {
+        return ClockRelation.EQUAL;
+    }
+    return ClockRelation.CONCURRENT;
+}
+```
+
+Example:
+
+```text
+A = {node-1: 3}
+B = {node-1: 2}
+A is AFTER B
+
+C = {node-1: 3}
+D = {node-2: 1}
+C and D are CONCURRENT
+
+E = {node-1: 3, node-2: 1}
+C = {node-1: 3}
+E is AFTER C
+```
+
+### Sibling merge logic
+
+Both `QuorumCoordinator` and `InMemoryKeyValueStore` use similar merge rules:
+
+```java
+for (VersionedValue existing : current) {
+    ClockRelation relation = incoming.compareVectorClock(existing);
+    if (relation == ClockRelation.AFTER) {
+        continue;
+    }
+    if (relation == ClockRelation.BEFORE) {
+        incomingSuperseded = true;
+        merged.add(existing);
+        continue;
+    }
+    if (relation == ClockRelation.EQUAL) {
+        merged.add(incoming.isNewerThan(existing) ? incoming : existing);
+        incomingSuperseded = true;
+        continue;
+    }
+    merged.add(existing);
+}
+if (!incomingSuperseded) {
+    merged.add(incoming);
+}
+```
+
+Meaning:
+
+- Incoming `AFTER` existing: drop existing.
+- Incoming `BEFORE` existing: keep existing and do not add incoming later.
+- `EQUAL`: keep the newer timestamp as a tie-breaker.
+- `CONCURRENT`: keep both as siblings.
+
+### Tombstones
+
+Deletes create tombstone versions:
+
+```java
+public static VersionedValue tombstone(String nodeId, long counter, Clock clock) {
+    return new VersionedValue(new byte[0], clock.millis(), Map.of(nodeId, counter), true);
+}
+```
+
+Reads use `latestIncludingTombstone`. If the newest causally visible version is a tombstone, the key is treated as not found.
+
+Why not immediately remove data:
+
+- A delete must be replicated and repaired just like a put.
+- If old replicas missed the delete, anti-entropy needs a tombstone to tell them the deletion happened.
+
+### How vector clocks are created here
+
+For coordinator writes:
+
+```java
+VersionedValue.put(value, coordinatorNodeId, localCounter.incrementAndGet(), clock)
+```
+
+For direct store writes:
+
+```java
+VersionedValue.mergeVectorClocks(getVersionsIncludingTombstone(key), nodeId, counter)
+```
+
+This difference matters:
+
+- Public `Put` through `QuorumCoordinator` creates a clock with only the coordinator's node id and local counter.
+- Direct `KeyValueStore.put` merges existing local versions first.
+- The public API does not include client vector-clock context.
+
+SDE-2 lens:
+
+- In production Dynamo-style APIs, clients often read siblings and send a causal context back on write so the system can know the update resolves those siblings.
+- This project demonstrates conflict detection and sibling retention, but not full client-driven conflict resolution.
+
+---
+
+## Replica RPC Layer
+
+The replica layer is the internal data plane between nodes.
+
+Files:
+
+- `src/main/java/com/distkv/replication/ReplicaClient.java`
+- `src/main/java/com/distkv/replication/GrpcReplicaClient.java`
+- `src/main/java/com/distkv/grpc/ReplicaServiceImpl.java`
+
+### Interface
+
+```java
+public interface ReplicaClient {
+    CompletableFuture<ReplicaWriteResult> write(NodeEndpoint node, String key, VersionedValue value);
+    CompletableFuture<ReplicaReadResult> read(NodeEndpoint node, String key);
+}
+```
+
+The coordinator depends on this interface instead of depending directly on gRPC. That makes the coordinator testable with `LocalReplicaClient`.
+
+### Local fast path
+
+`GrpcReplicaClient` avoids network when the target replica is itself:
+
+```java
+if (node.nodeId().equals(localEndpoint.nodeId())) {
+    return CompletableFuture.supplyAsync(() -> {
+        localStore.apply(key, value);
+        return ReplicaWriteResult.ok();
+    });
+}
+```
+
+Why this matters:
+
+- The coordinator is often also one of the replicas.
+- Local writes should not pay serialization and network overhead.
+- The same interface still works for local and remote targets.
+
+### Remote path
+
+```java
+ReplicaApplyResponse response = blockingStub(node).apply(ReplicaApplyRequest.newBuilder()
+        .setKey(key)
+        .setVersion(ProtoMappers.toProto(value))
+        .build());
+return response.getSuccess()
+        ? ReplicaWriteResult.ok()
+        : ReplicaWriteResult.failed(response.getMessage());
+```
+
+The blocking stub is used inside `CompletableFuture.supplyAsync`, so the coordinator can launch multiple replica calls concurrently.
+
+### Replica service
+
+On the receiving side:
+
+```java
+public void apply(ReplicaApplyRequest request, StreamObserver<ReplicaApplyResponse> responseObserver) {
+    store.apply(request.getKey(), ProtoMappers.fromProto(request.getVersion()));
+    responseObserver.onNext(ReplicaApplyResponse.newBuilder()
+            .setSuccess(true)
+            .setMessage("applied")
+            .build());
+    responseObserver.onCompleted();
+}
+```
+
+For reads:
+
+```java
+List<VersionedValue> versions = store.getVersionsIncludingTombstone(request.getKey());
+if (versions.isEmpty()) {
+    response.setFound(false);
+} else {
+    response.setFound(true)
+            .setVersion(ProtoMappers.toProto(VersionedValue.latestIncludingTombstone(versions)))
+            .addAllVersions(versions.stream().map(ProtoMappers::toProto).toList());
+}
+```
+
+Why return all versions:
+
+- A replica may store siblings.
+- The coordinator needs all sibling versions to merge conflict state across replicas.
+
+---
+
+## Storage Engine
+
+The local storage implementation is `src/main/java/com/distkv/storage/InMemoryKeyValueStore.java`.
+
+It combines:
+
+- `ConcurrentHashMap<String, List<VersionedValue>>` for in-memory data;
+- synchronized public methods for consistent compound updates;
+- `WALManager` for durability;
+- `BloomFilter` for fast negative checks;
+- access-order `LinkedHashMap` for LRU eviction;
+- vector-clock merge logic for siblings.
+
+### Interface
+
+```java
+public interface KeyValueStore {
+    VersionedValue put(String key, byte[] value, String nodeId, long counter);
+    VersionedValue delete(String key, String nodeId, long counter);
+    void apply(String key, VersionedValue value);
+    Optional<VersionedValue> get(String key);
+    Optional<VersionedValue> getIncludingTombstone(String key);
+    List<VersionedValue> getVersions(String key);
+    List<VersionedValue> getVersionsIncludingTombstone(String key);
+    List<StoredEntry> scan(String startKeyInclusive, String endKeyExclusive);
+    Map<String, VersionedValue> snapshot();
+    Map<String, List<VersionedValue>> snapshotVersions();
+}
+```
+
+### Apply path
+
+`apply` is the most important storage method because replica writes, hinted handoff, anti-entropy, and local writes all converge here.
+
+```java
+public synchronized void apply(String key, VersionedValue value) {
+    appendToWal(key, value);
+    values.compute(key, (ignored, current) -> {
+        List<VersionedValue> merged = mergeVersions(current, value);
+        estimatedMemoryBytes -= estimateEntryBytes(key, current);
+        estimatedMemoryBytes += estimateEntryBytes(key, merged);
+        return merged;
+    });
+    touch(key);
+    addToBloom(key);
+    evictIfNeeded();
+    compactWalIfNeeded();
+}
+```
+
+Order matters:
+
+1. Append to WAL first.
+2. Merge into memory.
+3. Update LRU state.
+4. Add to Bloom filter.
+5. Evict if over configured capacity.
+6. Compact WAL if threshold is reached.
+
+Why append before memory:
+
+- If the process crashes after the WAL append but before memory update, replay can recover the write.
+- If memory were updated first and then the process crashed before WAL append, the acknowledged write could disappear.
+
+Important nuance:
+
+- `WALManager.append` flushes/closes the stream but does not call `fsync`/`FileChannel.force`.
+- This is good enough for process-crash learning demos, but a production durability claim under power loss would require explicit sync strategy.
+
+### Get path
+
+```java
+public synchronized Optional<VersionedValue> get(String key) {
+    if (isDefinitelyAbsent(key)) {
+        return Optional.empty();
+    }
+    touch(key);
+    return getIncludingTombstone(key).filter(value -> !value.tombstone());
+}
+```
+
+Important behavior:
+
+- Bloom filter can skip definitely absent keys.
+- `get` hides tombstones.
+- `getIncludingTombstone` is used by replication/repair because internal systems must see deletes.
+
+### Scan path
+
+```java
+return values.entrySet().stream()
+        .filter(entry -> entry.getKey().compareTo(start) >= 0)
+        .filter(entry -> end.isBlank() || entry.getKey().compareTo(end) < 0)
+        .sorted(Map.Entry.comparingByKey())
+        .map(entry -> new StoredEntry(entry.getKey(), VersionedValue.latest(entry.getValue())))
+        .filter(entry -> entry.value() != null)
+        .toList();
+```
+
+Scan:
+
+- sorts lexicographically by key;
+- returns the latest non-tombstone version;
+- excludes deleted keys;
+- is local to a single node.
+
+---
+
+## WAL Durability And Recovery
+
+`src/main/java/com/distkv/storage/WALManager.java` handles binary write-ahead logging and snapshot compaction.
+
+### WAL record format
+
+Every record includes:
+
+```text
+magic int
+version byte
+key UTF
+timestamp long
+tombstone boolean
+value length int
+value bytes
+vector clock entry count int
+repeated nodeId UTF + counter long
+```
+
+The magic/version fields detect invalid or incompatible records.
+
+Append snippet:
+
+```java
+output.writeInt(MAGIC);
+output.writeByte(VERSION);
+output.writeUTF(key);
+writeVersion(output, value);
+output.flush();
+writesSinceCompaction++;
+```
+
+### Recovery
+
+Recovery loads a snapshot first, then replays WAL records into it:
+
+```java
+public synchronized Map<String, List<VersionedValue>> restore() throws IOException {
+    Map<String, List<VersionedValue>> restored = loadSnapshot();
+    replayWalInto(restored);
+    return restored;
+}
+```
+
+`InMemoryKeyValueStore.recoverFromWal()` then rebuilds in-memory state:
+
+```java
+values.clear();
+accessOrder.clear();
+estimatedMemoryBytes = 0;
+walManager.restore().forEach((key, versions) -> {
+    List<VersionedValue> copy = List.copyOf(versions);
+    values.put(key, copy);
+    estimatedMemoryBytes += estimateEntryBytes(key, copy);
+    touch(key);
+    versions.stream().filter(value -> !value.tombstone()).findAny().ifPresent(ignored -> addToBloom(key));
+});
+evictIfNeeded();
+```
+
+Why restore versions, not just latest values:
+
+- Sibling conflicts must survive restart.
+- Tombstones must survive restart.
+- Anti-entropy may need the full version set.
+
+### Compaction
+
+Without compaction, WAL grows forever. DistKV compacts after a configurable number of writes.
+
+```java
+public synchronized void compact(Map<String, List<VersionedValue>> snapshot) throws IOException {
+    Path tempSnapshot = snapshotPath.resolveSibling(snapshotPath.getFileName() + ".tmp");
+    try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(
+            tempSnapshot,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE)))) {
+        output.writeInt(SNAPSHOT_MAGIC);
+        output.writeByte(VERSION);
+        output.writeInt(snapshot.size());
+        // write all keys and versions
+    }
+    Files.move(tempSnapshot, snapshotPath, StandardCopyOption.REPLACE_EXISTING);
+    Files.newOutputStream(walPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING).close();
+    writesSinceCompaction = 0;
+}
+```
+
+Why temp file then move:
+
+- Avoid leaving a partially written snapshot at the final path.
+- Replace old snapshot atomically enough for a local filesystem learning project.
+
+SDE-2 lens:
+
+- WAL before memory is the key correctness invariant.
+- Snapshot plus WAL delta is a classic recovery optimization.
+- Production systems usually add checksums, segment files, fsync policies, corruption handling, and compaction scheduling/backpressure.
+
+---
+
+## Bloom Filter And LRU Eviction
+
+### Bloom filter
+
+`src/main/java/com/distkv/storage/BloomFilter.java` is a probabilistic membership filter.
+
+It answers:
+
+- "definitely not present" if any required bit is unset;
+- "might be present" if all required bits are set.
+
+It never has false negatives for inserted keys, but it can have false positives.
+
+Sizing math:
+
+```java
+public static int calculateBitSize(long expectedInsertions, double falsePositiveRate) {
+    return (int) Math.ceil(-(expectedInsertions * Math.log(falsePositiveRate)) / Math.pow(Math.log(2), 2));
+}
+
+public static int calculateHashCount(int bitSize, long expectedInsertions) {
+    return Math.max(1, (int) Math.round((bitSize / (double) expectedInsertions) * Math.log(2)));
+}
+```
+
+For 100,000 expected keys and 1 percent false positive rate:
+
+```text
+bits ~= 958,506 bits
+bytes ~= 119,814 bytes
+hash functions ~= 7
+```
+
+Implementation uses double hashing from SHA-256:
+
+```java
+long hash1 = buffer.getLong();
+long hash2 = buffer.getLong();
+for (int index = 0; index < hashCount; index++) {
+    long combined = hash1 + (index * hash2);
+    indexes[index] = Math.floorMod(combined, bitSize);
+}
+```
+
+Why use it here:
+
+- Avoids map lookup work for definitely absent keys.
+- Demonstrates a common storage-engine optimization.
+
+Trade-offs:
+
+- Standard Bloom filters cannot delete individual keys.
+- False positives still hit storage.
+- If keys are evicted from memory, the Bloom filter may still say "might contain", which is safe but less useful.
+
+### LRU eviction
+
+The store supports entry-count and approximate-memory caps:
+
+- `DISTKV_MAX_ENTRIES`
+- `DISTKV_MAX_MEMORY_BYTES`
+
+Access order is tracked with:
+
+```java
+private final LinkedHashMap<String, Boolean> accessOrder = new LinkedHashMap<>(16, 0.75f, true);
+```
+
+Eviction:
+
+```java
+while (isOverCapacity() && !accessOrder.isEmpty()) {
+    String eldestKey = accessOrder.keySet().iterator().next();
+    accessOrder.remove(eldestKey);
+    List<VersionedValue> removed = values.remove(eldestKey);
+    estimatedMemoryBytes -= estimateEntryBytes(eldestKey, removed);
+}
+```
+
+SDE-2 lens:
+
+- LRU protects memory, but evicting replicated data from memory does not delete it from WAL.
+- This store is not an LSM tree or disk-backed read path. After eviction, the key is gone from serving memory until restart/restore or repair writes it again.
+- For production, you would clarify whether eviction means cache eviction or data deletion from the serving store. Those are different designs.
+
+---
+
+## Membership And Failure Detection
+
+Membership keeps the ring aligned with which nodes are alive.
+
+Files:
+
+- `src/main/java/com/distkv/membership/MembershipList.java`
+- `src/main/java/com/distkv/membership/GossipService.java`
+- `src/main/java/com/distkv/membership/GrpcGossipPeerClient.java`
+- `src/main/java/com/distkv/grpc/AdminServiceImpl.java`
+
+### Member states
+
+```java
+public enum MemberStatus {
+    ALIVE,
+    SUSPECT,
+    DEAD
+}
+```
+
+State transition idea:
+
+```text
+ALIVE -> SUSPECT -> DEAD
+```
+
+With defaults:
+
+- gossip interval: 1 second;
+- suspect after 3 stale cycles;
+- dead after 6 stale cycles;
+- fanout: 2 peers per gossip round.
+
+### Gossip loop
+
+`GossipService.gossipOnce()`:
+
+```java
+membershipList.incrementLocalHeartbeat();
+List<MemberInfo> peers = new ArrayList<>(membershipList.healthyPeers());
+Collections.shuffle(peers);
+peers.stream().limit(fanout).forEach(peer -> {
+    try {
+        List<MemberInfo> remoteMembership = peerClient.exchange(peer.endpoint(), membershipList.snapshot());
+        membershipList.addOrMarkAlive(peer.endpoint());
+        membershipList.merge(remoteMembership);
+    } catch (Exception ignored) {
+        // Missed gossip rounds are converted to SUSPECT by markSuspects.
+    }
+});
+membershipList.markFailures(interval.toMillis(), suspectAfterCycles, deadAfterCycles)
+        .forEach(changeListener::onMemberDead);
+```
+
+Important implementation nuance:
+
+- The `GossipPeerClient` interface accepts local membership, but the gRPC implementation currently pulls the peer's `ClusterStatus` through `AdminService`; it does not send a push-pull gossip payload.
+- So this is gossip-style randomized membership polling rather than a full bidirectional gossip exchange.
+
+`GrpcGossipPeerClient`:
+
+```java
+return AdminServiceGrpc.newBlockingStub(channel(peer))
+        .withDeadlineAfter(rpcTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        .clusterStatus(ClusterStatusRequest.newBuilder().build())
+        .getNodesList()
+        .stream()
+        .map(node -> new MemberInfo(...))
+        .toList();
+```
+
+### Merge rules
+
+`MembershipList.merge`:
+
+```java
+if (remote.status() == MemberStatus.DEAD
+        && remote.lastSeenEpochMs() >= current.lastSeenEpochMs) {
+    current.status = MemberStatus.DEAD;
+    current.lastSeenEpochMs = now;
+    return current;
+}
+if (remote.heartbeat() > current.heartbeat.get()) {
+    current.endpoint = remote.endpoint();
+    current.heartbeat.set(remote.heartbeat());
+    current.lastSeenEpochMs = now;
+    current.status = MemberStatus.ALIVE;
+}
+```
+
+Meaning:
+
+- Higher heartbeat wins for liveness.
+- A sufficiently recent `DEAD` status can propagate.
+- Local node ignores remote records about itself.
+
+### Failure detection and ring update
+
+```java
+if (staleForMillis >= deadAfterMillis) {
+    member.status = MemberStatus.DEAD;
+    newlyDead.add(member.snapshot());
+} else if (staleForMillis >= suspectAfterMillis) {
+    member.status = MemberStatus.SUSPECT;
+}
+```
+
+`DistKvServer` wires dead-member callback to the ring:
+
+```java
+member -> ring.removeNode(member.endpoint().nodeId())
+```
+
+Effect:
+
+- Future operations skip dead nodes.
+- Current in-flight operations may still time out.
+- When a restarted node announces join, peers add it back to membership and ring.
+
+### Admin join and leave
+
+`AdminServiceImpl.nodeJoin`:
+
+```java
+NodeEndpoint endpoint = ProtoMappers.fromProto(request.getNode());
+membershipList.addOrMarkAlive(endpoint);
+ring.addNode(endpoint);
+```
+
+`AdminServiceImpl.nodeLeave`:
+
+```java
+boolean memberUpdated = membershipList.markDead(request.getNodeId());
+boolean ringUpdated = ring.removeNode(request.getNodeId());
+```
+
+SDE-2 lens:
+
+- Failure detectors are eventually accurate, not instantly accurate.
+- Network pauses can create false suspicions.
+- Removing nodes from the ring changes future replica sets. That improves availability but can change consistency semantics.
+- A production system would use incarnation numbers to avoid old `DEAD` messages overriding a restarted process with the same node id.
+
+---
+
+## Hinted Handoff
+
+Hinted handoff handles temporary replica unavailability during writes.
+
+File: `src/main/java/com/distkv/replication/HintedHandoffManager.java`
+
+### Problem
+
+If a replica is down, a coordinator may still satisfy quorum from other replicas. The down replica missed the write.
+
+Without repair, it can remain stale forever.
+
+### Implementation
+
+When a write attempt fails in `QuorumCoordinator.write`, the coordinator stores a hint:
+
+```java
+} else if (hintedHandoffManager != null) {
+    hintedHandoffManager.storeHint(attempt.node(), key, version);
+}
+```
+
+Hint:
+
+```java
+public record Hint(NodeEndpoint target, String key, VersionedValue value, long storedAtEpochMs) {
+}
+```
+
+Delivery loop:
+
+```java
+public void deliverHints() {
+    int attempts = hints.size();
+    for (int index = 0; index < attempts; index++) {
+        Hint hint = hints.poll();
+        if (hint == null) {
+            return;
+        }
+        CompletableFuture<ReplicaWriteResult> delivery = replicaClient.write(hint.target(), hint.key(), hint.value());
+        try {
+            ReplicaWriteResult result = delivery.get(500, TimeUnit.MILLISECONDS);
+            if (!result.acknowledged()) {
+                hints.add(hint);
+            }
+        } catch (Exception ignored) {
+            hints.add(hint);
+        }
+    }
+}
+```
+
+Why queue length is captured first:
+
+- It prevents one delivery pass from looping forever if failed hints are re-added.
+- New hints wait for the next pass.
+
+Current behavior:
+
+- Hints are in memory only.
+- Delivery runs every 2 seconds by default.
+- Hints are retried until the target acknowledges.
+- A hint does not count as a write acknowledgement.
+
+SDE-2 lens:
+
+- Hinted handoff is best for short outages.
+- Anti-entropy is still needed for long outages, lost hints, coordinator restarts, and missed repair cases.
+- Production systems persist hints, cap hint volume, expire old hints, and track per-target backoff.
+
+---
+
+## Anti-Entropy Repair And Merkle Hashing
+
+Anti-entropy periodically compares replicas and repairs divergence.
+
+Files:
+
+- `src/main/java/com/distkv/repair/AntiEntropyService.java`
+- `src/main/java/com/distkv/repair/MerkleTree.java`
+- `src/main/java/com/distkv/repair/GrpcAntiEntropyPeerClient.java`
+- `ReplicaServiceImpl.merkle`, `ReplicaServiceImpl.fetchVersions`, `ReplicaServiceImpl.applyVersions`
+
+### Why anti-entropy
+
+Quorum and hinted handoff are not enough:
+
+- A node may be down longer than hints survive.
+- A coordinator may crash with undelivered in-memory hints.
+- A write may succeed on quorum but fail on one replica.
+- Membership changes can leave replicas out of date.
+
+Anti-entropy gives eventual convergence.
+
+### Merkle tree in this project
+
+The class is called `MerkleTree`, but the implementation is a flat per-key hash map plus a root hash over those leaves.
+
+```java
+public static MerkleTree fromSnapshot(Map<String, List<VersionedValue>> snapshot) {
+    Map<String, String> leaves = new LinkedHashMap<>();
+    snapshot.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey())
+            .forEach(entry -> leaves.put(entry.getKey(), hashLeaf(entry.getKey(), entry.getValue())));
+    return new MerkleTree(hashRoot(leaves), leaves);
+}
+```
+
+Differing keys:
+
+```java
+public Set<String> differingKeys(MerkleTree other) {
+    Set<String> keys = new LinkedHashSet<>();
+    keys.addAll(leafHashes.keySet());
+    keys.addAll(other.leafHashes.keySet());
+    keys.removeIf(key -> leafHashes.getOrDefault(key, "").equals(other.leafHashes.getOrDefault(key, "")));
+    return keys;
+}
+```
+
+Why hash versions, not just values:
+
+- A key can have siblings.
+- A tombstone is meaningful state.
+- Vector clocks affect whether two replicas truly agree.
+
+Leaf hash includes:
+
+- key;
+- value bytes;
+- timestamp;
+- tombstone flag;
+- sorted vector clock entries.
+
+### Repair loop
+
+`AntiEntropyService.repairOnce()`:
+
+```java
+MerkleTree localTree = MerkleTree.fromSnapshot(localStore.snapshotVersions());
+for (NodeEndpoint peer : peersSupplier.get()) {
+    try {
+        MerkleTree remoteTree = peerClient.fetchMerkle(peer);
+        if (localTree.rootHash().equals(remoteTree.rootHash())) {
+            continue;
+        }
+        repairPeer(peer, localTree.differingKeys(remoteTree));
+    } catch (RuntimeException ignored) {
+        // Failed repairs are retried on the next anti-entropy pass.
+    }
+}
+```
+
+Repair per key:
+
+```java
+private void repairPeer(NodeEndpoint peer, Set<String> differingKeys) {
+    for (String key : differingKeys) {
+        List<VersionedValue> remoteVersions = peerClient.fetchVersions(peer, key);
+        remoteVersions.forEach(version -> localStore.apply(key, version));
+
+        List<VersionedValue> localVersions = localStore.getVersionsIncludingTombstone(key);
+        if (!localVersions.isEmpty()) {
+            peerClient.applyVersions(peer, key, localVersions);
+        }
+    }
+}
+```
+
+This is bidirectional:
+
+1. Fetch remote versions.
+2. Apply them locally.
+3. Fetch local merged versions.
+4. Push merged versions back to the peer.
+
+Important nuance:
+
+- `ReplicaServiceImpl.merkle` ignores `start_key` and `end_key` and builds a tree for the full local store.
+- The peer supplier in `DistKvServer` uses all ring nodes except self.
+- With a replication factor smaller than cluster size, this broad anti-entropy strategy could spread keys beyond their intended replica set. The default demo is 3 nodes with replication factor 3, so it is aligned there.
+
+SDE-2 lens:
+
+- Real Merkle trees reduce comparison cost by recursively comparing ranges. This implementation is simpler and fine for learning, but it sends all leaf hashes.
+- Production repair would compare only token ranges each peer is responsible for.
+- Repair should be rate-limited and observable because it can compete with foreground traffic.
+
+---
+
+## Client Library
+
+The Java client is `src/main/java/com/distkv/client/DistKvClient.java`.
+
+It gives users:
+
+- builder configuration;
+- random healthy-node selection;
+- retries with exponential backoff;
+- cluster-status refresh after failures;
+- blocking put/get/delete;
+- streaming scan iterator.
+
+Builder defaults:
+
+```java
+private ConsistencyLevel defaultConsistency = ConsistencyLevel.QUORUM;
+private int maxRetries = 3;
+private Duration initialBackoff = Duration.ofMillis(50);
+private Duration rpcTimeout = Duration.ofSeconds(1);
+```
+
+Retry loop:
+
+```java
+for (int attempt = 0; attempt <= maxRetries; attempt++) {
+    NodeEndpoint node = pickHealthyNode();
+    try {
+        T result = operation.apply(node);
+        healthyById.put(node.nodeId(), true);
+        return result;
+    } catch (StatusRuntimeException exception) {
+        healthyById.put(node.nodeId(), false);
+        lastFailure = exception;
+        refreshClusterStatus();
+        sleep(backoffMillis);
+        backoffMillis *= 2;
+    }
+}
+```
+
+Node picking:
+
+```java
+List<NodeEndpoint> healthyNodes = nodesById.values().stream()
+        .filter(node -> healthyById.getOrDefault(node.nodeId(), true))
+        .toList();
+```
+
+Why the client does not route keys itself:
+
+- The server has the authoritative ring and membership view.
+- Client-side routing would be faster but requires ring state distribution and versioning.
+- This client stays simple: pick any healthy node and let `KVServiceImpl` forward if needed.
+
+SDE-2 lens:
+
+- Client retry is useful for transient node failure.
+- Retrying writes can be dangerous if operations are not idempotent. Here, `Put` for a key/value is mostly idempotent at the business level, but each retry may create a new vector-clock version if it reaches the coordinator again.
+- Production APIs often include request ids or idempotency tokens.
+
+---
+
+## Observability
+
+`src/main/java/com/distkv/observability/DistKvMetrics.java` exports Prometheus metrics.
+
+### Request metrics
+
+```java
+public <T> T recordOperation(String op, Supplier<T> operation) {
+    Histogram.Timer timer = latency.labels(op).startTimer();
+    try {
+        return operation.get();
+    } finally {
+        timer.observeDuration();
+        opsTotal.labels(op).inc();
+    }
+}
+```
+
+Metrics:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `distkv_ops_total{op}` | Counter | Number of get/put/delete/scan operations. |
+| `distkv_latency_seconds{op}` | Histogram | Operation latency distribution. |
+| `distkv_quorum_failures_total` | Counter | Failed read/write quorum operations. |
+| `distkv_replication_lag_ms{node_id}` | Gauge | Oldest local hint age. |
+| `distkv_node_health{node_id}` | Gauge | 1 alive, 0.5 suspect, 0 dead. |
+| `distkv_wal_size_bytes{node_id}` | Gauge | Local WAL size. |
+| `distkv_pending_hints{node_id}` | Gauge | Number of queued hints. |
+
+Periodic reporting in `DistKvServer.java`:
+
+```java
+metricsReporter.scheduleAtFixedRate(() -> {
+    metrics.setNodeHealth(membershipList.snapshot());
+    metrics.setWalSizeBytes(nodeId, walManager.sizeBytes());
+    metrics.setPendingHints(nodeId, hintedHandoffManager.pendingHintCount());
+    metrics.setReplicationLagMs(nodeId, hintedHandoffManager.oldestHintAgeMillis(System.currentTimeMillis()));
+}, 0, 5, TimeUnit.SECONDS);
+```
+
+SDE-2 lens:
+
+- Metrics are part of the design, not a garnish.
+- Quorum failures and pending hints are early warning signs for degraded replication.
+- P99 latency matters because quorum systems are sensitive to slow replicas.
+- Node health should be interpreted with gossip delay in mind.
+
+---
+
+## Deployment And Runtime Configuration
+
+### Maven and generated code
+
+The Maven build uses:
+
+- Java 21;
+- gRPC 1.64.0;
+- protobuf 3.25.3;
+- Maven protobuf plugin to generate gRPC/protobuf Java classes;
+- Shade plugin to build a runnable jar.
+
+Commands:
+
+```bash
+mvn test
+mvn -DskipTests package
+java -jar target/distkv-0.1.0-SNAPSHOT.jar
+```
+
+### Docker Compose topology
+
+`deploy/docker-compose.yml` starts:
+
+- `distkv-node-1`
+- `distkv-node-2`
+- `distkv-node-3`
+- Prometheus
+- Grafana
+
+Each node listens on container port `50051`, mapped to host ports:
+
+| Node | Host gRPC | Host metrics |
+| --- | --- | --- |
+| node-1 | `localhost:50051` | `localhost:9101` |
+| node-2 | `localhost:50052` | `localhost:9102` |
+| node-3 | `localhost:50053` | `localhost:9103` |
+
+Inside Docker, peer hostnames use container names:
+
+```yaml
+DISTKV_PEERS: node-2:distkv-node-2:50051,node-3:distkv-node-3:50051
+```
+
+Prometheus scrapes:
+
+```yaml
+scrape_configs:
+  - job_name: distkv
+    static_configs:
+      - targets:
+          - distkv-node-1:9100
+          - distkv-node-2:9100
+          - distkv-node-3:9100
+```
+
+### Useful environment variables
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DISTKV_NODE_ID` | `node-1` | Logical node id used in ring, vector clocks, metrics. |
+| `DISTKV_HOST` | `localhost` | Advertised host for other nodes. |
+| `DISTKV_PORT` | `50051` | gRPC port. |
+| `DISTKV_METRICS_PORT` | `9100` | Prometheus HTTP metrics port. |
+| `DISTKV_REPLICATION_FACTOR` | `3` | Desired replicas per key. |
+| `DISTKV_DATA_DIR` | `data/<nodeId>` | WAL/snapshot directory. |
+| `DISTKV_PEERS` | empty | Static peers as `nodeId:host:port`. |
+| `DISTKV_MAX_ENTRIES` | `-1` | Entry LRU cap; `-1` means unlimited. |
+| `DISTKV_MAX_MEMORY_BYTES` | `-1` | Approximate memory cap; `-1` means unlimited. |
+| `DISTKV_BLOOM_EXPECTED_INSERTIONS` | `100000` | Bloom filter sizing input. |
+| `DISTKV_BLOOM_FALSE_POSITIVE_RATE` | `0.01` | Bloom filter target false positive rate. |
+| `DISTKV_WAL_COMPACTION_WRITES` | `10000` | Writes between WAL compactions. |
+| `DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS` | `30` | Repair interval. |
+
+### grpcurl examples
+
+Put:
+
+```bash
+grpcurl -plaintext \
+  -d '{"key":"hello","value":"d29ybGQ=","consistency":"QUORUM"}' \
+  localhost:50051 distkv.api.KVService/Put
+```
+
+Get:
+
+```bash
+grpcurl -plaintext \
+  -d '{"key":"hello","consistency":"QUORUM"}' \
+  localhost:50051 distkv.api.KVService/Get
+```
+
+Cluster status:
+
+```bash
+grpcurl -plaintext \
+  -d '{}' \
+  localhost:50051 distkv.api.AdminService/ClusterStatus
 ```
 
 ---
 
 ## Testing Strategy
 
-### 1. Unit Tests (What to Test)
+The tests are small, focused, and map well to learning topics.
 
-**File**: Any file with `*Test.java` suffix
+### Routing tests
 
-**Categories**:
+`src/test/java/com/distkv/routing/ConsistentHashRingTest.java`
 
-| Component | What to test | Example test |
-|-----------|--------------|--------------|
-| **ConsistentHashRing** | Key distribution, node add/remove, preference list | `testDistributionUniformity()`, `testPreferenceListUnique()` |
-| **VersionedValue** | Vector clock comparison, conflict detection | `testConcurrentWrites()`, `testVectorClockOrdering()` |
-| **WALManager** | Write, replay, snapshot compaction | `testWALReplayRecovery()`, `testCompactionAndReplay()` |
-| **BloomFilter** | False positive rate, insertion | `testFalsePositiveRate()` |
-| **QuorumCoordinator** | Read/write quorum, timeout handling | `testQuorumWriteSuccess()`, `testReadConflict()` |
-| **MembershipList** | Heartbeat increment, merge, failure detection | `testSuspectAfterMissedCycles()` |
+Covers:
 
-**Example test structure**:
+- preference lists contain distinct physical nodes;
+- virtual nodes distribute keys reasonably uniformly;
+- removed nodes disappear from preference lists.
 
-```java
-@Test
-void testQuorumWriteSuccessWithTwoOfThreeReplicas() {
-  // Arrange
-  QuorumCoordinator coordinator = new QuorumCoordinator(
-    "node-1", ring, replicaClient, replicationFactor=3, timeout=1s
-  );
+What to learn:
 
-  // Mock: 2 of 3 replicas respond
-  when(replicaClient.write(N1, "key", value))
-    .thenReturn(CompletableFuture.completedFuture(ok()));
-  when(replicaClient.write(N2, "key", value))
-    .thenReturn(CompletableFuture.completedFuture(ok()));
-  when(replicaClient.write(N3, "key", value))
-    .thenReturn(failedFuture(timeout()));
+- How ring lookup behaves when there are fewer physical nodes than requested replicas.
+- Why virtual nodes are tested with many synthetic keys.
 
-  // Act
-  WriteQuorumResult result = coordinator.put("key", bytes, QUORUM);
+### Quorum tests
 
-  // Assert
-  assertTrue(result.success());
-  assertEquals(2, result.acksReceived());
-}
-```
+`src/test/java/com/distkv/quorum/QuorumCalculatorTest.java`
 
-### 2. Integration Tests
+Covers:
 
-**What**: Test multiple layers together (without mocking).
+- ONE/QUORUM/ALL response counts;
+- read-write overlap combinations.
 
-**Example**: Start 3 real nodes, write with QUORUM, read, verify consistency.
+`src/test/java/com/distkv/replication/QuorumCoordinatorTest.java`
+
+Covers:
+
+- successful quorum write and read;
+- failed quorum write when too few replicas acknowledge.
+
+What to learn:
+
+- The coordinator can be tested without gRPC using `LocalReplicaClient`.
+- Quorum logic is separate from storage details.
+
+### Storage and WAL tests
+
+`InMemoryKeyValueStoreTest.java`
+
+Covers:
+
+- sibling conflict retention and resolution;
+- LRU by entry count;
+- approximate-memory LRU;
+- WAL compaction and recovery from snapshot.
+
+`WALManagerTest.java`
+
+Covers:
+
+- replay restores latest value;
+- replay preserves tombstone.
+
+What to learn:
+
+- Correctness requires preserving tombstones and siblings, not just latest non-deleted values.
+
+### Bloom filter tests
+
+`BloomFilterTest.java`
+
+Covers:
+
+- bit count and hash count calculation;
+- no false negatives for inserted keys;
+- false-positive rate stays within a test threshold.
+
+### Repair tests
+
+`HintedHandoffManagerTest.java`
+
+Covers:
+
+- hint remains queued while target is unreachable;
+- hint is removed after target becomes reachable and acknowledges.
+
+`MerkleTreeTest.java`
+
+Covers:
+
+- diverged keys are identified when values differ or keys are missing on one side.
+
+### Commands
+
+Run all tests:
 
 ```bash
-# Start 3 local nodes with real gRPC
-java -Dport=50051 ... &
-java -Dport=50052 ... &
-java -Dport=50053 ... &
-
-# Run integration test
-mvn test -Dgroups=integration
-
-# Test: put("key", "value", QUORUM) → get("key", QUORUM)
+mvn test
 ```
 
-### 3. Chaos Tests
-
-**What**: Kill nodes, partition network, verify system recovers.
-
-**Example test**: Chaos quorum test
+Run one test:
 
 ```bash
-cd deploy
-docker compose up --build -d
-
-# In another terminal:
-./test/chaos/chaos-quorum.sh
-
-# Script does:
-# 1. Write burst to N1 with QUORUM
-# 2. Kill N3 mid-burst
-# 3. Continue writing with only 2 nodes
-# 4. Verify quorum still works
-# 5. Stop N2, write with ONE
-# 6. Verify hinted handoff / anti-entropy kicks in
+mvn -Dtest=QuorumCoordinatorTest test
 ```
 
-### 4. Load Tests
-
-**What**: Measure throughput, latency, and behavior under load.
+Build jar:
 
 ```bash
-# Build the demo client
 mvn -DskipTests package
-
-# Run demo with load
-java -cp target/distkv-0.1.0-SNAPSHOT.jar \
-  com.distkv.client.DistKvDemoClient cluster
-
-# Monitor with Prometheus/Grafana
-# http://localhost:3000 (admin/admin)
 ```
 
----
+Run Docker demo:
 
-## Running Demos
-
-### Demo 1: Local Single Node
-
-**Quick start**:
-```bash
-# Terminal 1: Start one node
-java -jar target/distkv-0.1.0-SNAPSHOT.jar
-# Listens on localhost:50051
-
-# Terminal 2: Use grpcurl
-grpcurl -plaintext \
-  -d '{"key":"hello","value":"d29ybGQ=","consistency":"QUORUM"}' \
-  localhost:50051 distkv.api.KVService/Put
-
-grpcurl -plaintext \
-  -d '{"key":"hello","consistency":"QUORUM"}' \
-  localhost:50051 distkv.api.KVService/Get
-
-# Or use Java client
-java -cp target/distkv-0.1.0-SNAPSHOT.jar \
-  com.distkv.client.DistKvDemoClient smoke
-```
-
-**What it shows**: Basic Put/Get works.
-
----
-
-### Demo 2: Local 3-Node Cluster
-
-**Setup**:
-```bash
-# Terminal 1: Node 1
-DISTKV_NODE_ID=node-1 \
-DISTKV_PORT=50051 \
-java -jar target/distkv-0.1.0-SNAPSHOT.jar
-
-# Terminal 2: Node 2
-DISTKV_NODE_ID=node-2 \
-DISTKV_HOST=localhost \
-DISTKV_PORT=50052 \
-DISTKV_PEERS=node-1:localhost:50051 \
-java -jar target/distkv-0.1.0-SNAPSHOT.jar
-
-# Terminal 3: Node 3
-DISTKV_NODE_ID=node-3 \
-DISTKV_HOST=localhost \
-DISTKV_PORT=50053 \
-DISTKV_PEERS=node-1:localhost:50051,node-2:localhost:50052 \
-java -jar target/distkv-0.1.0-SNAPSHOT.jar
-```
-
-**Test quorum**:
-```bash
-# All 3 nodes are alive, write reaches all 3
-java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.client.DistKvDemoClient cluster
-
-# Check cluster status (before/after removing a node)
-grpcurl -plaintext -d '{}' localhost:50051 distkv.api.AdminService/ClusterStatus
-```
-
-**What it shows**: 
-- Consistent hashing maps keys across 3 nodes
-- Quorum writes reach multiple replicas
-- Gossip keeps nodes aware of each other
-
----
-
-### Demo 3: Docker Compose (Full Stack)
-
-**One command to start everything**:
 ```bash
 cd deploy
 docker compose up --build -d
-
-# Services running:
-# - localhost:50051 (node-1 gRPC)
-# - localhost:50052 (node-2 gRPC)
-# - localhost:50053 (node-3 gRPC)
-# - localhost:9090 (Prometheus)
-# - localhost:3000 (Grafana: admin/admin)
 ```
 
-**Grafana dashboard**:
-1. Go to http://localhost:3000
-2. Login with admin/admin
-3. Open the auto-provisioned DistKV dashboard
-4. Watch metrics in real-time as you write/read
+Run chaos script:
 
-**Panels**:
-- **Ops/sec**: How many get/put/delete per second
-- **P99 latency**: 99th percentile latency (watch spikes when nodes fail)
-- **Node health**: Heatmap showing which nodes are alive
-- **Quorum failures**: Failed writes (should be 0 with healthy nodes)
-- **WAL size**: Disk space per node
-
-The dashboard JSON lives at `deploy/grafana-dashboard.json`; provisioning files under `deploy/grafana/provisioning` wire Grafana to Prometheus automatically.
-
-**Cleanup**:
 ```bash
-docker compose down -v
-```
-
----
-
-### Demo 4: Chaos - Kill Node Mid-Write
-
-**Run the chaos test**:
-```bash
-cd deploy
-docker compose up --build -d
-cd ..
-
 ./test/chaos/chaos-quorum.sh
 ```
 
-**What it does**:
-1. Starts 3 nodes in Docker
-2. Writes 100 keys to N1 with QUORUM
-3. After 50 keys, kills N3 with `docker stop`
-4. Continues writing with only 2 nodes
-5. Verifies quorum succeeds (W=2, only 2 nodes left)
-6. Reads a key back, verifies it's there
-7. Brings N3 back
-8. Verifies N3 catches up via anti-entropy
+Important note about the chaos script:
 
-**Expected output**:
-```
-✓ Cluster started
-✓ Writing with QUORUM (N1, N2, N3)...
-✓ 50 keys written
-✗ Killing N3
-✓ Continuing writes with N1, N2 only
-✓ 100 keys written (quorum still works!)
-✓ Read key back: SUCCESS
-✓ Bringing N3 back
-✓ Waiting for anti-entropy repair...
-✓ N3 caught up
-✓ All 100 keys present on all 3 nodes
-```
-
-**What it demonstrates**:
-- Quorum survives node failure
-- Hinted handoff stores writes locally
-- Anti-entropy repair heals divergence
-- No single point of failure
+- It writes 25 keys before stopping node 3 and 25 keys after.
+- It reads one key written after the failure.
+- It restarts node 3.
+- It does not deeply verify that every key repaired on every node. You can extend it for stronger validation.
 
 ---
 
-### Demo 5: Test Bloom Filter Performance
+## Known Limitations And Design Improvements
 
-**What**: See how Bloom filter avoids unnecessary lookups.
+This section is important for SDE-2 preparation. A strong engineer can explain both what works and what is intentionally simplified.
 
-```bash
-# Run this test
-java -cp target/distkv-0.1.0-SNAPSHOT.jar com.distkv.storage.BloomFilterTest
+### Consistency limitations
 
-# Expected output:
-# Bloom filter false positive rate: ~1.0%
-# (should be close to configured 1%)
-```
+- This is eventually consistent, not linearizable.
+- Quorum overlap reduces stale-read risk but does not eliminate all anomalies under coordinator changes, clock issues, partitions, or retry races.
+- Public `Put` does not accept prior vector-clock context, so client-driven conflict resolution is incomplete.
+- Reads do not perform synchronous read repair.
 
----
+Improvements:
 
-## Interview Talking Points
+- Add client causal context to `PutRequest`.
+- Add compare-and-set or conditional writes for stronger semantics.
+- Add read repair for stale replicas discovered during reads.
+- Add request ids for idempotent retries.
 
-### 1. "How does consistent hashing work?"
+### Durability limitations
 
-**Answer structure**:
-- Map keys and nodes to a hash space (ring)
-- Each node gets virtual tokens for better distribution
-- To find replicas: hash key, walk clockwise, collect N distinct physical nodes
-- Advantage: adding/removing nodes only reshuffles ~1/N of the keyspace
-- Demo: show ConsistentHashRing distributes uniformly across virtual tokens
+- WAL append does not explicitly fsync.
+- Hints are memory-only.
+- WAL has no checksum per record.
+- Tombstones are never garbage collected.
 
-**Code pointer**: `ConsistentHashRing.java:60-80`
+Improvements:
 
----
+- Use file segments and checksums.
+- Add configurable sync policy: every write, every N ms, or batch fsync.
+- Persist hinted handoff queues.
+- Add tombstone grace period and compaction cleanup.
 
-### 2. "Why is R + W > N important?"
+### Membership limitations
 
-**Answer structure**:
-- N = total replicas (3)
-- W = write quorum (2)
-- R = read quorum (2)
-- R + W > N (2+2 > 3) means read and write sets must overlap
-- Overlap guarantees reads see latest write
-- Demo: kill one node, show QUORUM still succeeds with 2/3
+- Gossip is implemented as randomized pull of `ClusterStatus`, not full push-pull gossip.
+- No incarnation number for restarted nodes.
+- A dead static peer is reintroduced mainly through join announcement on restart.
+- Failure detection can be fooled by network pauses.
 
-**Code pointer**: `QuorumCalculator.java`
+Improvements:
 
----
+- Add incarnation numbers.
+- Add push-pull membership payload exchange.
+- Add peer probing with indirect checks.
+- Add membership versioning and stronger conflict resolution for ALIVE/DEAD records.
 
-### 3. "How do you handle concurrent writes?"
+### Routing and repair limitations
 
-**Answer structure**:
-- Use vector clocks: map of {nodeId → counter}
-- Compare clocks to determine causality
-- If CONCURRENT (neither < or >), keep both as siblings
-- Client can use last-write-wins, merge, or ask user
-- Demo: show conflict detection in get response
+- Anti-entropy compares full local stores with all peers.
+- Merkle implementation is flat leaf-hash comparison, not range-recursive.
+- If cluster size exceeds replication factor, broad repair can copy keys to nodes outside their intended replica set.
+- Node join does not perform explicit token-range bootstrap.
 
-**Code pointer**: `VersionedValue.java:47-84`, `ClockRelation.java`
+Improvements:
 
----
+- Repair only token ranges owned by the peer pair.
+- Implement hierarchical Merkle trees by token range.
+- Add bootstrap streaming when a node joins.
+- Add decommission streaming when a node leaves.
 
-### 4. "How do you ensure durability?"
+### Storage limitations
 
-**Answer structure**:
-- Write-ahead log: append to disk BEFORE updating memory
-- On crash: reload from WAL
-- Optimize with snapshots: take full snapshot every N writes, truncate WAL
-- On restart: load snapshot + replay WAL delta (faster)
-- Demo: kill a node mid-write, restart, verify data is there
+- In-memory store means data serving depends on memory state.
+- LRU eviction removes keys from serving memory, not just a cache layer.
+- No disk-backed point lookup except restart replay.
+- No compaction strategy for sibling explosion.
 
-**Code pointer**: `WALManager.java`
+Improvements:
 
----
+- Add SSTables/LSM tree or B-tree backed local store.
+- Separate cache eviction from durable data ownership.
+- Add sibling limits and conflict-resolution policies.
+- Track per-key metadata for last access/update.
 
-### 5. "How does failure detection work?"
+### Security and operations limitations
 
-**Answer structure**:
-- Gossip protocol: each node pings random peers, exchanges membership lists
-- If peer doesn't increment heartbeat for 3 cycles: SUSPECT
-- If still no heartbeat for 3 more cycles: DEAD, remove from ring
-- Advantage: no centralized coordinator, spreads info in O(log n) time
-- Demo: docker stop one node, watch it go SUSPECT → DEAD in Grafana
+- gRPC uses plaintext.
+- No authentication or authorization.
+- No rate limiting.
+- No backpressure on repair traffic.
+- No structured logging/tracing.
 
-**Code pointer**: `GossipService.java:63-78`, `MembershipList.java`
+Improvements:
 
----
-
-### 6. "How does data repair work?"
-
-**Answer structure**:
-- Hinted handoff: if replica is down, store write locally as "hint", deliver when replica recovers
-- Anti-entropy: periodically compare replicas using Merkle tree, sync diverged keys
-- Guarantees eventual consistency: all replicas eventually converge
-- Demo: kill node, write more data, bring node back, show anti-entropy syncs it
-
-**Code pointer**: `HintedHandoffManager.java`, `MerkleTree.java`, `AntiEntropyService.java`
+- Add TLS/mTLS.
+- Add auth tokens or service identity.
+- Add OpenTelemetry traces.
+- Add rate limits for foreground and repair requests.
+- Add admin endpoints for draining, bootstrap, compaction, and health.
 
 ---
 
-### 7. "Why a Bloom filter?"
+## SDE-2 Interview Questions
 
-**Answer structure**:
-- Bloom filter is a probabilistic data structure for membership testing
-- Can answer "definitely not present" with certainty
-- False positives possible, but false negatives impossible
-- Space-efficient: ~120KB for 100k keys at 1% false positive rate
-- Use case: skip expensive storage lookups for missing keys
-- Demo: measure false positive rate matches configured value
+### How would you describe this project in 60 seconds?
 
-**Code pointer**: `BloomFilter.java`, README Bloom Filter Math section
+DistKV is a Java 21, gRPC-based, Dynamo-style distributed key-value store. It maps keys to replica sets using consistent hashing with virtual nodes. Any client can contact any node; the server forwards to the key's coordinator, which fans reads and writes to replicas and applies ONE, QUORUM, or ALL consistency. Values carry vector clocks and tombstones, so concurrent writes become sibling versions and deletes replicate safely. Local storage is in-memory but backed by a binary WAL and snapshot compaction. Gossip-style membership removes dead nodes from routing, while hinted handoff and anti-entropy repair help replicas converge after failures. Prometheus and Grafana expose operational health.
 
----
+### Why use consistent hashing?
 
-### 8. "What consistency levels are supported?"
+Consistent hashing minimizes key movement when nodes join or leave. Instead of `hash(key) % nodeCount`, both keys and virtual node tokens live on a ring. For a key, we walk clockwise and collect distinct physical nodes. Virtual nodes improve distribution and reduce skew.
 
-**Answer structure**:
-- ONE: fastest, least durable (read from any node, write to any node)
-- QUORUM: balanced (read from majority, write to majority), default
-- ALL: slowest, most durable (all replicas must participate)
-- R + W > N guarantees consistency for QUORUM/ALL
-- Demo: show different latencies for each level
+### What does `R + W > N` give you?
 
-**Code pointer**: `QuorumCalculator.java`, `ConsistencyLevel` enum in kv.proto
+It gives read/write quorum overlap when read and write operations use the same replica universe. If `W` replicas acknowledged a write and a later read contacts `R` replicas, overlap means at least one read replica saw the write. In this project, the quorum size is computed from the current preference list size, so if dead nodes are removed, discuss the guarantee over the current live replica set rather than the original configured replication factor.
 
----
+### Is this strongly consistent?
 
-### 9. "How does membership change work?"
+No. It is Dynamo-style eventual consistency. Quorum reads and writes reduce stale reads, but concurrent writes can create siblings, reads do not do synchronous read repair, and membership changes can change replica sets. It prioritizes availability and convergence.
 
-**Answer structure**:
-- AdminService.NodeJoin: add new node, it gets virtual tokens on ring
-- AdminService.NodeLeave: remove node, its keys redistribute
-- Gossip detects node death automatically (don't need explicit leave)
-- Ring update: future operations skip dead node
-- Demo: docker stop node, show it disappears from ClusterStatus
+### How are conflicts handled?
 
-**Code pointer**: `AdminServiceImpl.java`
+Values carry vector clocks. If an incoming version dominates an existing version, it replaces it. If it is older, it is ignored. If the two are concurrent, both are kept as siblings. Reads return all merged versions so clients can see conflicts.
 
----
+### How does delete work?
 
-### 10. "Why did you choose Java + gRPC?"
+Delete writes a tombstone version through the same quorum path as put. A tombstone prevents old replicas from resurrecting deleted values during repair. Reads treat the key as not found when the latest version is a tombstone.
 
-**Answer structure**:
-- Java: well-known, mature ecosystem, excellent concurrency model
-- gRPC: binary protocol (efficient), supports streaming, works on any platform
-- Protobuf: type-safe serialization, code generation
-- Netty: performant async I/O under the hood
-- Demo: show performance metrics in Grafana
+### Why WAL before memory?
 
----
+Write-ahead logging protects acknowledged writes from process crashes. The store appends the version to WAL first and then mutates memory. On restart it loads a snapshot and replays WAL records to reconstruct versions, including siblings and tombstones.
 
-## Next Steps
+### What is hinted handoff?
 
-1. **Read the code** in this order:
-   - `kv.proto` - understand the wire format
-   - `VersionedValue.java` - core data model
-   - `ConsistentHashRing.java` - routing logic
-   - `QuorumCoordinator.java` - orchestration
-   - `WALManager.java` - durability
-   - `GossipService.java` - membership
+If a replica write attempt fails, the coordinator stores a hint containing the target, key, version, and timestamp. A background task retries delivery. This helps short outages converge without waiting for periodic anti-entropy.
 
-2. **Run the demos**:
-   - Single node: verify Put/Get work
-   - 3-node cluster: watch consistent hashing
-   - Docker Compose: monitor with Prometheus/Grafana
-   - Chaos test: see quorum survive failure
+### Why still need anti-entropy?
 
-3. **Modify and experiment**:
-   - Change replication factor from 3 to 5
-   - Change consistency level from QUORUM to ONE, measure latency
-   - Add a new metric (e.g., cache hit rate on Bloom filter)
-   - Write a new chaos test (e.g., network partition)
+Hints can be lost, a node may be down for too long, or a coordinator may crash. Anti-entropy periodically compares replica state with Merkle-style hashes, fetches differing key versions, and applies/pushes merged versions.
 
-4. **Interview preparation**:
-   - Practice the talking points above
-   - Be ready to draw the architecture diagram
-   - Explain tradeoffs (consistency vs latency, N vs R+W)
-   - Discuss failure modes (network partitions, Byzantine faults)
+### How does failure detection affect routing?
+
+Gossip increments local heartbeat, polls random healthy peers, merges membership, and marks stale peers as `SUSPECT` or `DEAD`. Dead nodes are removed from the consistent hash ring, so future preference lists skip them.
+
+### What would you improve first for production?
+
+A strong answer:
+
+1. Persist hints and add fsync/checksum strategy for WAL.
+2. Add client vector-clock context and idempotency tokens.
+3. Add read repair and token-range-aware anti-entropy.
+4. Add membership incarnation numbers.
+5. Add TLS/auth and operational controls.
 
 ---
 
-## Summary
+## Study Plan
 
-**DistKV is a production-grade Dynamo-style distributed KV store that teaches**:
+### Day 1: API and architecture
 
-✓ Consistent hashing and routing
-✓ Quorum replication and eventual consistency
-✓ Vector clocks for conflict detection
-✓ Write-ahead logging for durability
-✓ Gossip protocols for membership
-✓ Hinted handoff and anti-entropy repair
-✓ Bloom filters for performance
-✓ gRPC and Protocol Buffers for RPC
-✓ Observability with Prometheus/Grafana
-✓ Chaos testing for reliability
+Read:
 
-Each component solves a real problem in distributed systems. Together, they build a system that's:
-- **Available**: survives node failures via replication
-- **Partition-tolerant**: works across network partitions
-- **Eventually consistent**: all replicas converge (AP in CAP theorem)
+- `src/main/proto/kv.proto`
+- `DistKvServer.java`
+- `KVServiceImpl.java`
+- `ProtoMappers.java`
 
-Good luck! 🚀
+Practice:
+
+- Draw the architecture without looking.
+- Explain why there are three gRPC services.
+- Run one node and use `grpcurl` for put/get.
+
+### Day 2: Routing and quorum
+
+Read:
+
+- `ConsistentHashRing.java`
+- `QuorumCalculator.java`
+- `QuorumCoordinator.java`
+- `ReplicaClient.java`
+- `GrpcReplicaClient.java`
+
+Practice:
+
+- Explain preference list generation.
+- Explain how `ONE`, `QUORUM`, and `ALL` change latency and availability.
+- Run `ConsistentHashRingTest` and `QuorumCoordinatorTest`.
+
+### Day 3: Versioning and storage
+
+Read:
+
+- `VersionedValue.java`
+- `ClockRelation.java`
+- `InMemoryKeyValueStore.java`
+- `WALManager.java`
+- `BloomFilter.java`
+
+Practice:
+
+- Work through vector-clock examples on paper.
+- Explain why tombstones exist.
+- Run storage and WAL tests.
+
+### Day 4: Membership and repair
+
+Read:
+
+- `MembershipList.java`
+- `GossipService.java`
+- `AdminServiceImpl.java`
+- `HintedHandoffManager.java`
+- `AntiEntropyService.java`
+- `MerkleTree.java`
+
+Practice:
+
+- Explain the difference between hinted handoff and anti-entropy.
+- Explain how a node becomes `DEAD` and how it re-enters.
+- Run hinted handoff and Merkle tests.
+
+### Day 5: Operations and trade-offs
+
+Read:
+
+- `DistKvMetrics.java`
+- `deploy/docker-compose.yml`
+- `deploy/prometheus.yml`
+- `test/chaos/chaos-quorum.sh`
+
+Practice:
+
+- Start Docker Compose.
+- Watch Prometheus/Grafana while running demo writes.
+- Kill a node and explain what should happen to quorum, hints, gossip, and repair.
+- Prepare a "what I would improve" answer.
+
+---
+
+## Quick Reference
+
+### Read code in this order
+
+1. `src/main/proto/kv.proto`
+2. `src/main/java/com/distkv/server/DistKvServer.java`
+3. `src/main/java/com/distkv/routing/ConsistentHashRing.java`
+4. `src/main/java/com/distkv/replication/QuorumCoordinator.java`
+5. `src/main/java/com/distkv/model/VersionedValue.java`
+6. `src/main/java/com/distkv/storage/InMemoryKeyValueStore.java`
+7. `src/main/java/com/distkv/storage/WALManager.java`
+8. `src/main/java/com/distkv/membership/GossipService.java`
+9. `src/main/java/com/distkv/repair/AntiEntropyService.java`
+10. `src/main/java/com/distkv/client/DistKvClient.java`
+
+### Core invariants
+
+- A key maps to a preference list through the hash ring.
+- The first preference-list node coordinates public get/put/delete.
+- Writes are appended to WAL before memory is mutated.
+- Replicas merge versions by vector-clock relation.
+- Tombstones are replicated delete versions.
+- Quorum success is based on required responses for the current replica list.
+- Dead nodes are removed from future routing.
+- Hints and anti-entropy repair missed writes.
+
+### Best one-line mental model
+
+DistKV is a Dynamo-inspired AP key-value store: consistent hashing chooses replicas, quorum RPCs give tunable consistency, vector clocks preserve conflicts, WAL protects local writes, gossip changes routing around failures, and repair mechanisms eventually converge replicas.
