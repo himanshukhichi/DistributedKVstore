@@ -149,6 +149,7 @@ Request flow:
   - Hinted handoff delivery.
   - Merkle divergence detection.
 - Chaos demo in `test/chaos` kills a node during a write burst and verifies quorum behavior with two of three replicas alive.
+- `DistKvBenchmarkClient` drives concurrent gRPC traffic against a local cluster and reports throughput plus client-side latency percentiles.
 
 ## Build And Test
 
@@ -246,6 +247,56 @@ Bring everything down:
 ```bash
 cd deploy
 docker compose down -v
+```
+
+## Benchmark Results
+
+The benchmark harness runs a five-node Docker cluster with replication factor `3`, coordinator-aware request routing, Prometheus scraping, tmpfs-backed node data directories, and a configurable Java gRPC load client.
+
+Build the benchmark image and start the five-node cluster:
+
+```bash
+# From the repository root
+docker build -t distkv-benchmark:latest .
+cd deploy
+docker compose -f docker-compose.benchmark.yml -p distkvbench up -d
+```
+
+Run the benchmark client:
+
+```bash
+docker run --rm --network distkvbench_default --entrypoint java distkv-benchmark:latest \
+  -cp /app/distkv.jar com.distkv.client.DistKvBenchmarkClient \
+  --nodes node-1:node-1:50051,node-2:node-2:50051,node-3:node-3:50051,node-4:node-4:50051,node-5:node-5:50051 \
+  --routing coordinator \
+  --replication-factor 3 \
+  --consistency QUORUM \
+  --operation put \
+  --concurrency 64 \
+  --warmup-seconds 5 \
+  --duration-seconds 30 \
+  --value-bytes 64
+```
+
+Validated local result from a clean five-node run:
+
+| Workload | Duration | Concurrency | Successes | Failures | Throughput | P50 | P95 | P99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| QUORUM `PUT`, 64-byte values, RF=3 | 30s | 64 | 462,494 | 0 | 15,412.85 ops/sec | 3.295 ms | 9.645 ms | 18.329 ms |
+
+Best short tuning run observed:
+
+| Workload | Duration | Concurrency | Successes | Failures | Throughput | P50 | P95 | P99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| QUORUM `PUT`, 64-byte values, RF=3 | 10s | 64 | 305,921 | 0 | 30,586.79 ops/sec | 1.730 ms | 4.313 ms | 9.312 ms |
+
+The earlier `50K+ ops/sec with sub-10ms P99` claim was not reproduced by these local runs. The defensible result is approximately `15.4K` QUORUM writes/sec with `18.3 ms` P99 over a clean 30-second run, with a short tuning run peaking around `30.6K` writes/sec at `9.3 ms` P99.
+
+Bring the benchmark cluster down:
+
+```bash
+cd deploy
+docker compose -f docker-compose.benchmark.yml -p distkvbench down
 ```
 
 ## grpcurl Examples

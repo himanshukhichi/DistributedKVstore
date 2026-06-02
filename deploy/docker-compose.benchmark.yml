@@ -1,0 +1,111 @@
+services:
+  node-1:
+    image: distkv-benchmark:latest
+    container_name: distkv-bench-node-1
+    environment:
+      DISTKV_NODE_ID: node-1
+      DISTKV_HOST: node-1
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-1
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-2:node-2:50051,node-3:node-3:50051,node-4:node-4:50051,node-5:node-5:50051
+      DISTKV_WAL_COMPACTION_WRITES: 100000000
+      DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS: 3600
+      DISTKV_BLOOM_EXPECTED_INSERTIONS: 5000000
+    ports:
+      - "51051:50051"
+      - "9201:9100"
+    tmpfs:
+      - /data:size=1g
+
+  node-2:
+    image: distkv-benchmark:latest
+    container_name: distkv-bench-node-2
+    environment:
+      DISTKV_NODE_ID: node-2
+      DISTKV_HOST: node-2
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-2
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:node-1:50051,node-3:node-3:50051,node-4:node-4:50051,node-5:node-5:50051
+      DISTKV_WAL_COMPACTION_WRITES: 100000000
+      DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS: 3600
+      DISTKV_BLOOM_EXPECTED_INSERTIONS: 5000000
+    ports:
+      - "51052:50051"
+      - "9202:9100"
+    tmpfs:
+      - /data:size=1g
+
+  node-3:
+    image: distkv-benchmark:latest
+    container_name: distkv-bench-node-3
+    environment:
+      DISTKV_NODE_ID: node-3
+      DISTKV_HOST: node-3
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-3
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:node-1:50051,node-2:node-2:50051,node-4:node-4:50051,node-5:node-5:50051
+      DISTKV_WAL_COMPACTION_WRITES: 100000000
+      DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS: 3600
+      DISTKV_BLOOM_EXPECTED_INSERTIONS: 5000000
+    ports:
+      - "51053:50051"
+      - "9203:9100"
+    tmpfs:
+      - /data:size=1g
+
+  node-4:
+    image: distkv-benchmark:latest
+    container_name: distkv-bench-node-4
+    environment:
+      DISTKV_NODE_ID: node-4
+      DISTKV_HOST: node-4
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-4
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:node-1:50051,node-2:node-2:50051,node-3:node-3:50051,node-5:node-5:50051
+      DISTKV_WAL_COMPACTION_WRITES: 100000000
+      DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS: 3600
+      DISTKV_BLOOM_EXPECTED_INSERTIONS: 5000000
+    ports:
+      - "51054:50051"
+      - "9204:9100"
+    tmpfs:
+      - /data:size=1g
+
+  node-5:
+    image: distkv-benchmark:latest
+    container_name: distkv-bench-node-5
+    environment:
+      DISTKV_NODE_ID: node-5
+      DISTKV_HOST: node-5
+      DISTKV_PORT: 50051
+      DISTKV_METRICS_PORT: 9100
+      DISTKV_DATA_DIR: /data/node-5
+      DISTKV_REPLICATION_FACTOR: 3
+      DISTKV_PEERS: node-1:node-1:50051,node-2:node-2:50051,node-3:node-3:50051,node-4:node-4:50051
+      DISTKV_WAL_COMPACTION_WRITES: 100000000
+      DISTKV_ANTI_ENTROPY_INTERVAL_SECONDS: 3600
+      DISTKV_BLOOM_EXPECTED_INSERTIONS: 5000000
+    ports:
+      - "51055:50051"
+      - "9205:9100"
+    tmpfs:
+      - /data:size=1g
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: distkv-bench-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus-benchmark.yml:/etc/prometheus/prometheus.yml:ro
+
