@@ -117,38 +117,8 @@ public final class WALManager {
         return Files.exists(walPath) ? Files.size(walPath) : 0L;
     }
 
-    public Path walPath() {
-        return walPath;
-    }
-
     public Path snapshotPath() {
         return snapshotPath;
-    }
-
-    private Map<String, VersionedValue> replayWalLatestOnly() throws IOException {
-        Map<String, VersionedValue> restored = new LinkedHashMap<>();
-        if (Files.size(walPath) == 0) {
-            return restored;
-        }
-        try (DataInputStream input = new DataInputStream(new BufferedInputStream(Files.newInputStream(walPath)))) {
-            while (true) {
-                try {
-                    int magic = input.readInt();
-                    if (magic != MAGIC) {
-                        throw new IOException("invalid WAL record magic in " + walPath);
-                    }
-                    byte version = input.readByte();
-                    if (version != VERSION) {
-                        throw new IOException("unsupported WAL version " + version);
-                    }
-                    String key = input.readUTF();
-                    restored.put(key, readVersion(input));
-                } catch (EOFException ignored) {
-                    break;
-                }
-            }
-        }
-        return restored;
     }
 
     private void replayWalInto(Map<String, List<VersionedValue>> restored) throws IOException {

@@ -49,6 +49,17 @@ public final class QuorumCoordinator {
         this.hintedHandoffManager = hintedHandoffManager;
     }
 
+    /**
+     * Re-seed the monotonic counter after a restart so new writes are not mistaken for stale
+     * ancestors of versions recovered from the WAL. The counter lives only in memory and would
+     * otherwise restart at zero, causing the merge logic to silently discard acknowledged writes
+     * to any key that already held a higher counter on disk. Pass the highest counter previously
+     * stamped by this coordinator's node id (see {@code InMemoryKeyValueStore.recoveredCounterFor}).
+     */
+    public void seedLocalCounter(long observedMaxCounter) {
+        localCounter.updateAndGet(current -> Math.max(current, observedMaxCounter));
+    }
+
     public WriteQuorumResult put(String key, byte[] value, ConsistencyLevel consistencyLevel) {
         VersionedValue version = VersionedValue.put(value, coordinatorNodeId, localCounter.incrementAndGet(), clock);
         return write(key, version, consistencyLevel);

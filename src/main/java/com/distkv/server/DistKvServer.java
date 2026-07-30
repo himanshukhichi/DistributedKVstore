@@ -87,6 +87,9 @@ public final class DistKvServer {
                 Duration.ofMillis(750),
                 clock,
                 hintedHandoffManager);
+        // Restore the coordinator's monotonic counter so writes after a restart are ordered
+        // strictly after the versions already recovered from the WAL.
+        coordinator.seedLocalCounter(store.recoveredCounterFor(nodeId));
 
         GrpcGossipPeerClient peerClient = new GrpcGossipPeerClient(Duration.ofMillis(500));
         GossipService gossipService = new GossipService(

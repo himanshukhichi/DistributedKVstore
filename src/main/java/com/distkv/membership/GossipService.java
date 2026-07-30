@@ -70,7 +70,7 @@ public final class GossipService implements AutoCloseable {
                 membershipList.addOrMarkAlive(peer.endpoint());
                 membershipList.merge(remoteMembership);
             } catch (Exception ignored) {
-                // Missed gossip rounds are converted to SUSPECT by markSuspects.
+                // Missed gossip rounds are converted to SUSPECT/DEAD by markFailures below.
             }
         });
         membershipList.markFailures(interval.toMillis(), suspectAfterCycles, deadAfterCycles)

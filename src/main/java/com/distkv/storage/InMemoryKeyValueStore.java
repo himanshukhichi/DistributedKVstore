@@ -7,7 +7,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +25,7 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
     private final int maxEntries;
     private final long maxMemoryBytes;
     private final BloomFilter bloomFilter;
+    private final Map<String, Long> recoveredMaxCounterByNode = new LinkedHashMap<>();
     private long estimatedMemoryBytes;
 
     public InMemoryKeyValueStore(Clock clock) {
@@ -61,15 +61,31 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
         }
         values.clear();
         accessOrder.clear();
+        recoveredMaxCounterByNode.clear();
         estimatedMemoryBytes = 0;
         walManager.restore().forEach((key, versions) -> {
             List<VersionedValue> copy = List.copyOf(versions);
             values.put(key, copy);
             estimatedMemoryBytes += estimateEntryBytes(key, copy);
             touch(key);
+            // Track the highest counter seen per node so a coordinator can re-seed its
+            // monotonic counter after restart instead of restarting from zero.
+            copy.forEach(version -> version.vectorClock().forEach((clockNodeId, counter) ->
+                    recoveredMaxCounterByNode.merge(clockNodeId, counter, Math::max)));
             versions.stream().filter(value -> !value.tombstone()).findAny().ifPresent(ignored -> addToBloom(key));
         });
         evictIfNeeded();
+    }
+
+    /**
+     * Highest vector-clock counter observed for {@code nodeId} across all versions restored
+     * from the WAL/snapshot. A coordinator uses this after restart to re-seed its monotonic
+     * counter; otherwise it would restart from zero and stamp new writes with counters lower
+     * than the recovered versions, causing the merge logic to discard acknowledged writes as
+     * stale ancestors. Captured during recovery (before any LRU eviction).
+     */
+    public synchronized long recoveredCounterFor(String nodeId) {
+        return recoveredMaxCounterByNode.getOrDefault(nodeId, 0L);
     }
 
     @Override
@@ -163,34 +179,12 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
     }
 
     @Override
-    public synchronized Map<String, VersionedValue> snapshot() {
-        Map<String, VersionedValue> snapshot = new LinkedHashMap<>();
-        values.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey())
-                .forEach(entry -> {
-                    VersionedValue latest = VersionedValue.latest(entry.getValue());
-                    if (latest != null) {
-                        snapshot.put(entry.getKey(), latest);
-                    }
-                });
-        return snapshot;
-    }
-
-    @Override
     public synchronized Map<String, List<VersionedValue>> snapshotVersions() {
         return values.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
                 .collect(LinkedHashMap::new,
                         (map, entry) -> map.put(entry.getKey(), List.copyOf(entry.getValue())),
                         LinkedHashMap::putAll);
-    }
-
-    public synchronized List<String> sortedKeys() {
-        return values.keySet().stream().sorted(Comparator.naturalOrder()).toList();
-    }
-
-    public synchronized int size() {
-        return values.size();
     }
 
     private void appendToWal(String key, VersionedValue value) {

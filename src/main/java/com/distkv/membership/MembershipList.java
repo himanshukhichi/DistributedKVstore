@@ -97,18 +97,6 @@ public final class MembershipList {
         }
     }
 
-    public void markSuspects(long gossipIntervalMillis, int suspectAfterCycles) {
-        long now = clock.millis();
-        long suspectAfterMillis = gossipIntervalMillis * suspectAfterCycles;
-        members.forEach((nodeId, member) -> {
-            if (!nodeId.equals(localNodeId)
-                    && member.status != MemberStatus.DEAD
-                    && now - member.lastSeenEpochMs >= suspectAfterMillis) {
-                member.status = MemberStatus.SUSPECT;
-            }
-        });
-    }
-
     public List<MemberInfo> markFailures(long gossipIntervalMillis, int suspectAfterCycles, int deadAfterCycles) {
         long now = clock.millis();
         long suspectAfterMillis = gossipIntervalMillis * suspectAfterCycles;

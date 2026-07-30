@@ -11,8 +11,6 @@ public final class BloomFilter {
     private final BitSet bits;
     private final int bitSize;
     private final int hashCount;
-    private final long expectedInsertions;
-    private final double falsePositiveRate;
 
     public BloomFilter(long expectedInsertions, double falsePositiveRate) {
         if (expectedInsertions < 1) {
@@ -21,8 +19,6 @@ public final class BloomFilter {
         if (falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
             throw new IllegalArgumentException("falsePositiveRate must be between 0 and 1");
         }
-        this.expectedInsertions = expectedInsertions;
-        this.falsePositiveRate = falsePositiveRate;
         this.bitSize = calculateBitSize(expectedInsertions, falsePositiveRate);
         this.hashCount = calculateHashCount(bitSize, expectedInsertions);
         this.bits = new BitSet(bitSize);
@@ -51,14 +47,6 @@ public final class BloomFilter {
 
     public int hashCount() {
         return hashCount;
-    }
-
-    public long expectedInsertions() {
-        return expectedInsertions;
-    }
-
-    public double configuredFalsePositiveRate() {
-        return falsePositiveRate;
     }
 
     public static int calculateBitSize(long expectedInsertions, double falsePositiveRate) {

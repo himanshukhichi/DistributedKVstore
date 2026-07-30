@@ -88,10 +88,6 @@ public final class ConsistentHashRing {
         return physicalNodes.size();
     }
 
-    public int virtualNodes() {
-        return virtualNodes;
-    }
-
     public static BigInteger hash(String input) {
         try {
             MessageDigest digest = MessageDigest.getInstance("MD5");

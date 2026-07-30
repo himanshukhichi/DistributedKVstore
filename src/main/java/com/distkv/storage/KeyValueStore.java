@@ -23,7 +23,5 @@ public interface KeyValueStore {
 
     List<StoredEntry> scan(String startKeyInclusive, String endKeyExclusive);
 
-    Map<String, VersionedValue> snapshot();
-
     Map<String, List<VersionedValue>> snapshotVersions();
 }

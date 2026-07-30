@@ -109,12 +109,6 @@ public final class VersionedValue {
         return latest;
     }
 
-    public static List<VersionedValue> visible(List<VersionedValue> values) {
-        return values.stream()
-                .filter(value -> !value.tombstone())
-                .toList();
-    }
-
     public static Map<String, Long> mergeVectorClocks(List<VersionedValue> values, String nodeId, long nextCounter) {
         Map<String, Long> merged = new LinkedHashMap<>();
         for (VersionedValue value : values) {

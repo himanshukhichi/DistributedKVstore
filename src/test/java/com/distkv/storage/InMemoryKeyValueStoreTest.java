@@ -65,6 +65,21 @@ class InMemoryKeyValueStoreTest {
     }
 
     @Test
+    void recoversHighestCounterPerNodeFromWal() throws IOException {
+        WALManager walManager = new WALManager(tempDir.resolve("node-a.wal"), 1000);
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore(clock, walManager);
+        store.apply("alpha", new VersionedValue("a".getBytes(), 100, Map.of("node-a", 7L), false));
+        store.apply("beta", new VersionedValue("b".getBytes(), 101, Map.of("node-a", 42L, "node-b", 3L), false));
+
+        InMemoryKeyValueStore recovered = new InMemoryKeyValueStore(clock, walManager);
+        recovered.recoverFromWal();
+
+        assertEquals(42L, recovered.recoveredCounterFor("node-a"));
+        assertEquals(3L, recovered.recoveredCounterFor("node-b"));
+        assertEquals(0L, recovered.recoveredCounterFor("node-c"));
+    }
+
+    @Test
     void compactsWalToSnapshotAndRecoversFromSnapshot() throws IOException {
         WALManager walManager = new WALManager(tempDir.resolve("node-a.wal"), 2);
         InMemoryKeyValueStore store = new InMemoryKeyValueStore(clock, walManager);
